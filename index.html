@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="es" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hoja de cálculo</title>
+<meta name="description" content="Hoja de cálculo en el navegador: fórmulas, formato, gráficas y archivos de Excel.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='1' width='14' height='14' rx='2.5' fill='%231a7f4b'/%3E%3Cpath d='M1 6h14M1 10.3h14M6 1v14' stroke='%23fff' stroke-width='1'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app"></div>
+<noscript>Esta hoja de cálculo necesita JavaScript para funcionar.</noscript>
+
+<!-- motor -->
+<script src="js/core/base.js"></script>
+<script src="js/formula/syntax.js"></script>
+<script src="js/formula/numfmt.js"></script>
+<script src="js/formula/eval.js"></script>
+<script src="js/formula/fn-math.js"></script>
+<script src="js/formula/fn-stats.js"></script>
+<script src="js/formula/fn-text.js"></script>
+<script src="js/formula/fn-logic.js"></script>
+<script src="js/formula/fn-lookup.js"></script>
+<script src="js/formula/fn-date.js"></script>
+<script src="js/formula/fn-fin.js"></script>
+<script src="js/formula/fn-eng.js"></script>
+<script src="js/model/workbook.js"></script>
+<script src="js/model/ops.js"></script>
+<!-- interfaz -->
+<script src="js/ui/dom.js"></script>
+<script src="js/ui/grid.js"></script>
+<script src="js/ui/app.js"></script>
+<script src="js/ui/editor.js"></script>
+<script src="js/ui/chrome.js"></script>
+<script src="js/ui/dialogs.js"></script>
+<script src="js/charts/render.js"></script>
+<script src="js/charts/charts.js"></script>
+<script src="js/io/xlsx.js"></script>
+<script src="js/io/files.js"></script>
+<script>
+  window.addEventListener('DOMContentLoaded', function () { HC.app.init(); });
+</script>
+</body>
+</html>

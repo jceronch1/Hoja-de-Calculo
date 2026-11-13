@@ -115,7 +115,12 @@
     closeFrom(0);
   }, true);
   window.addEventListener('blur', () => closeFrom(0));
-  window.addEventListener('resize', () => closeFrom(0));
+  window.addEventListener('resize', () => {
+    if (stack[0]?.reposition) {
+      closeFrom(1);
+      stack[0].reposition();
+    } else closeFrom(0);
+  });
   // Muestra el elemento junto a un ancla (elemento o {x, y}). opts: {side: 'bottom'|'right', level, onClose}
   ui.popup = function (el, at, opts) {
     opts = opts || {};
@@ -123,23 +128,25 @@
     closeFrom(level);
     el.classList.add('popup');
     layer().appendChild(el);
-    const vw = window.innerWidth, vh = window.innerHeight;
-    let x, y;
-    if (at instanceof Element) {
-      const r = at.getBoundingClientRect();
-      if (opts.side === 'right') { x = r.right - 2; y = r.top - 4; } else { x = r.left; y = r.bottom + 2; }
+    function position() {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      if (opts.keepOnResize) el.style.maxHeight = Math.max(120, vh - 12) + 'px';
       const w = el.offsetWidth, hh = el.offsetHeight;
-      if (x + w > vw - 4) x = opts.side === 'right' ? Math.max(4, r.left - w + 2) : Math.max(4, vw - w - 4);
-      if (y + hh > vh - 4) y = opts.side === 'right' ? Math.max(4, vh - hh - 4) : r.top - hh - 2 > 4 ? r.top - hh - 2 : Math.max(4, vh - hh - 4);
-    } else {
-      x = at.x; y = at.y;
-      const w = el.offsetWidth, hh = el.offsetHeight;
-      if (x + w > vw - 4) x = Math.max(4, vw - w - 4);
-      if (y + hh > vh - 4) y = Math.max(4, vh - hh - 4);
+      let x, y;
+      if (at instanceof Element) {
+        const r = at.getBoundingClientRect();
+        if (opts.side === 'right') { x = r.right - 2; y = r.top - 4; } else { x = r.left; y = r.bottom + 2; }
+        if (x + w > vw - 4) x = opts.side === 'right' ? Math.max(4, r.left - w + 2) : Math.max(4, vw - w - 4);
+        if (y + hh > vh - 4) y = opts.side === 'right' ? Math.max(4, vh - hh - 4) : r.top - hh - 2 > 4 ? r.top - hh - 2 : Math.max(4, vh - hh - 4);
+      } else {
+        x = Math.max(4, Math.min(at.x, vw - w - 4));
+        y = Math.max(4, Math.min(at.y, vh - hh - 4));
+      }
+      el.style.left = Math.round(x) + 'px'; el.style.top = Math.round(y) + 'px';
+      el.style.maxHeight = Math.max(120, vh - Math.max(4, y) - 8) + 'px';
     }
-    el.style.left = Math.round(x) + 'px'; el.style.top = Math.round(y) + 'px';
-    el.style.maxHeight = Math.max(120, vh - Math.max(4, y) - 8) + 'px';
-    const rec = { el, anchor: at instanceof Element ? at : null, onClose: opts.onClose, level };
+    position();
+    const rec = { el, anchor: at instanceof Element ? at : null, onClose: opts.onClose, level, reposition: opts.keepOnResize ? position : null };
     stack.push(rec);
     return () => { const i = stack.indexOf(rec); if (i >= 0) closeFrom(i); };
   };
@@ -178,8 +185,12 @@
         it.sub ? h('span.menu-arrow', ui.icon('right', 12)) : null);
       const idx = rows.length;
       rows.push({ el: row, item: it });
-      row.addEventListener('pointerenter', () => setActive(idx, true));
-      row.addEventListener('click', (e) => { e.stopPropagation(); run(it); });
+      row.addEventListener('pointerenter', (e) => { if (e.pointerType !== 'touch') setActive(idx, true); });
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (it.sub && (e.pointerType === 'touch' || e.sourceCapabilities?.firesTouchEvents)) setActive(idx, true);
+        else run(it);
+      });
       el.appendChild(row);
     });
     el.addEventListener('keydown', (e) => {
@@ -203,6 +214,13 @@
   // ---------------------------------------------------------------- diálogos
   const dialogs = [];
   ui.dialogOpen = () => dialogs.length > 0;
+  ui.handleAndroidBack = () => {
+    if (ui.popupOpen()) { ui.closePopups(); return true; }
+    if (ui.dialogOpen()) { dialogs[dialogs.length - 1].close(); return true; }
+    if (HC.app && HC.app.edit) { HC.app.cancelEdit(); return true; }
+    if (HC.app?.cancelTouchFill?.()) return true;
+    return false;
+  };
   // opts: {title, body, buttons: [{label, primary, danger, action (devuelve false para no cerrar)}], width, onClose}
   ui.dialog = function (opts) {
     closeFrom(0);
@@ -322,11 +340,51 @@
     return ui.popup(el, at, { level: opts.level || 0 });
   };
 
-  ui.download = function (blob, filename) {
+  let resolveAndroidExport = null;
+  ui.androidExportResult = (status) => {
+    const saved = status === 'saved';
+    const resolve = resolveAndroidExport;
+    resolveAndroidExport = null;
+    if (resolve) resolve(saved);
+    if (saved) ui.toast('Archivo guardado.');
+    else if (status === 'error') ui.alert('No se pudo guardar el archivo.', 'Guardar archivo');
+  };
+
+  function readBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result.slice(reader.result.indexOf(',') + 1));
+      reader.onerror = reader.onabort = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  ui.download = async function (blob, filename) {
+    const bridge = window.AndroidSpreadsheet;
+    if (bridge) {
+      if (resolveAndroidExport || !bridge.beginExport()) {
+        ui.toast('No se pudo iniciar el guardado.');
+        return false;
+      }
+      const result = new Promise((resolve) => { resolveAndroidExport = resolve; });
+      try {
+        const chunkSize = 192 * 1024;
+        for (let offset = 0; offset < blob.size; offset += chunkSize) {
+          const chunk = await readBase64(blob.slice(offset, offset + chunkSize));
+          if (!bridge.appendExport(chunk)) throw new Error('Error al preparar el archivo.');
+        }
+        if (!bridge.finishExport(filename)) throw new Error('Error al elegir el destino.');
+      } catch (error) {
+        bridge.abortExport();
+        ui.androidExportResult('error');
+      }
+      return result;
+    }
     const url = URL.createObjectURL(blob);
     const a = h('a', { href: url, download: filename });
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
+    return true;
   };
   ui.pickFile = (accept) => new Promise((res) => {
     const inp = h('input', { type: 'file', accept, style: { display: 'none' } });

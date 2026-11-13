@@ -259,6 +259,43 @@
 
   // ---------------------------------------------------------------- escritura: libro
   const CF_OPS = { gt: 'greaterThan', gte: 'greaterThanOrEqual', lt: 'lessThan', lte: 'lessThanOrEqual', eq: 'equal', neq: 'notEqual', between: 'between', nbetween: 'notBetween' };
+  const FILTER_OPS = { equal: 'eq', notEqual: 'neq', greaterThan: 'gt', greaterThanOrEqual: 'gte', lessThan: 'lt', lessThanOrEqual: 'lte' };
+  const escapeWildcard = (text) => text.replace(/[~*?]/g, '~$&');
+  const unescapeWildcard = (text) => text.replace(/~([~*?])/g, '$1');
+  function readFilterSpec(column) {
+    const filters = kid(column, 'filters');
+    if (filters) {
+      if (kids(filters, 'dateGroupItem').length) return null;
+      const values = kids(filters, 'filter').map((el) => attr(el, 'val'));
+      if (/^(1|true)$/.test(attr(filters, 'blank'))) values.push('');
+      return { values, matchDisplay: true };
+    }
+    const group = kid(column, 'customFilters');
+    const clauses = kids(group, 'customFilter');
+    const rawOp = (el) => FILTER_OPS[attr(el, 'operator') || 'equal'];
+    const value = (el) => attr(el, 'val') ?? '';
+    const number = (text) => /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text) && Number.isFinite(Number(text)) ? Number(text) : null;
+    if (clauses.length === 2 && /^(1|true)$/.test(attr(group, 'and'))) {
+      const lower = clauses.find((el) => rawOp(el) === 'gte'), upper = clauses.find((el) => rawOp(el) === 'lte');
+      if (!lower || !upper) return null;
+      const v1 = number(value(lower)), v2 = number(value(upper));
+      return v1 != null && v2 != null ? { op: 'between', v1, v2 } : null;
+    }
+    if (clauses.length !== 1) return null;
+    const op = rawOp(clauses[0]), text = value(clauses[0]), n = number(text);
+    if (!op) return null;
+    if (op === 'neq' && text === ' ') return { op: 'nblank' };
+    if (op !== 'eq' && op !== 'neq') return n != null ? { op, v1: n } : null;
+    const wildcard = Array.from(text.matchAll(/~[~*?]|[*?]/g)).filter((match) => match[0].length === 1);
+    if (!wildcard.length) return { op, v1: n ?? unescapeWildcard(text) };
+    const beginsWithStar = wildcard[0].index === 0 && wildcard[0][0] === '*';
+    const endsWithStar = wildcard[wildcard.length - 1].index === text.length - 1 && wildcard[wildcard.length - 1][0] === '*';
+    if (wildcard.length !== Number(beginsWithStar) + Number(endsWithStar)) return null;
+    if (beginsWithStar && endsWithStar) return { op: op === 'eq' ? 'contains' : 'ncontains', v1: unescapeWildcard(text.slice(1, -1)) };
+    if (op === 'eq' && beginsWithStar) return { op: 'ends', v1: unescapeWildcard(text.slice(1)) };
+    if (op === 'eq' && endsWithStar) return { op: 'begins', v1: unescapeWildcard(text.slice(0, -1)) };
+    return null;
+  }
   function cfValue(v) {
     const s = String(v == null ? '' : v).trim();
     if (s[0] === '=') return HC.canonicalizeFormula(s.slice(1));
@@ -333,22 +370,25 @@
         const g = wb.filterBounds(sh), fcols = [];
         for (const k of Object.keys(sh.filter.cols || {})) {
           const spec = sh.filter.cols[k];
-          if (spec.hidden) {
-            const items = wb.filterItems(sh, +k).filter((it) => spec.hidden.indexOf(it.text) < 0);
-            fcols.push('<filterColumn colId="' + k + '"><filters' + (items.some((it) => it.text === '') ? ' blank="1"' : '') + '>' + items.filter((it) => it.text !== '').map((it) => '<filter val="' + xe(it.text) + '"/>').join('') + '</filters></filterColumn>');
+          if (spec.hidden || spec.values) {
+            const passes = HC.filterTest(spec);
+            const values = wb.filterItems(sh, +k).filter(({ v, text }) => passes(v, () => text)).map(({ key }) => key);
+            fcols.push('<filterColumn colId="' + k + '"><filters' + (values.includes('') ? ' blank="1"' : '') + '>'
+              + values.filter((value) => value !== '').map((value) => '<filter val="' + xe(value) + '"/>').join('') + '</filters></filterColumn>');
           } else {
             const v1 = String(spec.v1 == null ? '' : spec.v1), v2 = String(spec.v2 == null ? '' : spec.v2);
+            const literal = escapeWildcard(v1);
             const one = (op, v) => '<customFilter' + (op ? ' operator="' + op + '"' : '') + ' val="' + xe(v) + '"/>';
             let inner = null;
             switch (spec.op) {
-              case 'eq': inner = '<customFilters>' + one(null, v1) + '</customFilters>'; break;
-              case 'neq': inner = '<customFilters>' + one('notEqual', v1) + '</customFilters>'; break;
+              case 'eq': inner = '<customFilters>' + one(null, literal) + '</customFilters>'; break;
+              case 'neq': inner = '<customFilters>' + one('notEqual', literal) + '</customFilters>'; break;
               case 'gt': case 'gte': case 'lt': case 'lte': inner = '<customFilters>' + one({ gt: 'greaterThan', gte: 'greaterThanOrEqual', lt: 'lessThan', lte: 'lessThanOrEqual' }[spec.op], v1) + '</customFilters>'; break;
               case 'between': inner = '<customFilters and="1">' + one('greaterThanOrEqual', v1) + one('lessThanOrEqual', v2) + '</customFilters>'; break;
-              case 'contains': inner = '<customFilters>' + one(null, '*' + v1 + '*') + '</customFilters>'; break;
-              case 'ncontains': inner = '<customFilters>' + one('notEqual', '*' + v1 + '*') + '</customFilters>'; break;
-              case 'begins': inner = '<customFilters>' + one(null, v1 + '*') + '</customFilters>'; break;
-              case 'ends': inner = '<customFilters>' + one(null, '*' + v1) + '</customFilters>'; break;
+              case 'contains': inner = '<customFilters>' + one(null, '*' + literal + '*') + '</customFilters>'; break;
+              case 'ncontains': inner = '<customFilters>' + one('notEqual', '*' + literal + '*') + '</customFilters>'; break;
+              case 'begins': inner = '<customFilters>' + one(null, literal + '*') + '</customFilters>'; break;
+              case 'ends': inner = '<customFilters>' + one(null, '*' + literal) + '</customFilters>'; break;
               case 'blank': inner = '<filters blank="1"/>'; break;
               case 'nblank': inner = '<customFilters>' + one('notEqual', ' ') + '</customFilters>'; break;
             }
@@ -677,7 +717,16 @@
       for (const m of all(kid(doc, 'mergeCells'), 'mergeCell')) { const g = HC.parseA1(attr(m, 'ref')); if (g) S.merges.push(g); }
       // filtro
       const af = kid(doc, 'autoFilter');
-      if (af && attr(af, 'ref')) { const g = HC.parseA1(attr(af, 'ref')); if (g) S.filter = { range: g, cols: {} }; }
+      const filterRange = af && HC.parseA1(attr(af, 'ref') || '');
+      if (filterRange) {
+        const cols = {};
+        for (const column of kids(af, 'filterColumn')) {
+          const offset = Number(attr(column, 'colId')), spec = readFilterSpec(column);
+          if (spec && Number.isInteger(offset) && offset >= 0 && filterRange.c1 + offset <= filterRange.c2) cols[offset] = spec;
+        }
+        S.filter = { range: filterRange, cols, autoExpand: false };
+        S.restoreFilterRows = Object.keys(cols).length > 0;
+      }
       // validación de datos
       const VT = { list: 'list', whole: 'whole', decimal: 'decimal', date: 'date', textLength: 'textlen' }, VO = { between: 'between', notBetween: 'nbetween', equal: 'eq', notEqual: 'neq', greaterThan: 'gt', greaterThanOrEqual: 'gte', lessThan: 'lt', lessThanOrEqual: 'lte' };
       for (const dv of all(doc, 'dataValidation')) {

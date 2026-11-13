@@ -244,7 +244,6 @@
       try { for (let i = tx.ops.length - 1; i >= 0; i--) this._applyOp(tx.ops[i], true); } finally { this._replay = false; }
       this.redoStack.push(tx);
       if (tx.structural) this._rebuildAll();
-      if (this.refreshFilters) this.refreshFilters();
       this.recalc(); this.modified = true;
       this.emit('change', tx);
       return tx;
@@ -256,7 +255,6 @@
       try { for (const op of tx.ops) this._applyOp(op, false); } finally { this._replay = false; }
       this.undoStack.push(tx);
       if (tx.structural) this._rebuildAll();
-      if (this.refreshFilters) this.refreshFilters();
       this.recalc(); this.modified = true;
       this.emit('change', tx);
       return tx;
@@ -473,10 +471,23 @@
     recalc() {
       if (this._inRecalc) return;
       this._inRecalc = true; this.pass++;
-      try {
-        for (const c of this.volatile) this._markDirty(c);
+      const evaluateDirty = () => {
         for (const cell of this.dirty) {
           if (cell.d && cell.f != null) this._evalTop(cell); else cell.d = false;
+        }
+        this.dirty.clear();
+      };
+      try {
+        for (const c of this.volatile) this._markDirty(c);
+        evaluateDirty();
+        if (this.refreshFilters && this.refreshFilters()) {
+          // Las fórmulas de subtotal dependen de la visibilidad además del contenido de las celdas.
+          for (const sh of this.sheets) sh.rows.forEach((row) => {
+            if (row) row.forEach((cell) => {
+              if (cell && cell.f && /\b(SUBTOTAL|AGGREGATE)\s*\(/i.test(cell.f)) this._markDirty(cell);
+            });
+          });
+          evaluateDirty();
         }
       } finally { this.dirty.clear(); this._inRecalc = false; }
       this.gen++;
@@ -766,7 +777,21 @@
       sh.merges = adjList(sh.merges).filter((g) => g.r1 !== g.r2 || g.c1 !== g.c2);
       sh.condFmts = sh.condFmts.map((cf) => Object.assign({}, cf, { ranges: adjList(cf.ranges) })).filter((cf) => cf.ranges.length);
       sh.validations = sh.validations.map((v) => Object.assign({}, v, { ranges: adjList(v.ranges) })).filter((v) => v.ranges.length);
-      if (sh.filter) { const g = adj(sh.filter.range); sh.filter = g && (insert || !(isRow && sh.filter.range.r1 >= at && sh.filter.range.r1 <= b)) ? Object.assign({}, sh.filter, { range: g }) : null; if (!sh.filter) { sh.rowH.filtered = new Set(); sh.rowH.touch(); } }
+      if (sh.filter) {
+        const f = sh.filter, g = adj(f.range);
+        if (!g || (!insert && isRow && f.range.r1 >= at && f.range.r1 <= b)) sh.filter = null;
+        else if (isRow) sh.filter = { ...f, range: g };
+        else {
+          const cols = {};
+          for (const [offset, spec] of Object.entries(f.cols || {})) {
+            const c = f.range.c1 + Number(offset);
+            if (!insert && c >= at && c <= b) continue;
+            const moved = c < at ? c : c + (insert ? n : -n);
+            if (moved >= g.c1 && moved <= g.c2) cols[moved - g.c1] = spec;
+          }
+          sh.filter = { ...f, range: g, cols };
+        }
+      }
       const ax = isRow ? sh.rowH : sh.colW;
       ax.shift(at, insert ? n : -n);
       const stKey = isRow ? 'rowStyle' : 'colStyle', styles = sh[stKey].slice();
@@ -885,6 +910,13 @@
       for (const n of data.names || []) if (n && n.name && n.f != null) wb.names.set(n.name.toUpperCase(), { name: n.name, f: n.f, sheet: n.sheet || null });
       wb.active = HC.clamp(data.active || 0, 0, wb.sheets.length - 1);
       wb._rebuildAll(); wb.recalc();
+      data.sheets.forEach((d, i) => {
+        if (!d.restoreFilterRows) return;
+        const axis = wb.sheets[i].rowH;
+        // Excel usa el mismo indicador de fila oculta para el autofiltro.
+        for (const r of axis.filtered) axis.hidden.delete(r);
+        axis.touch();
+      });
       return wb;
     }
     static blank() {

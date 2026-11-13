@@ -9,6 +9,7 @@
 
   const app = (HC.app = {
     wb: null, grid: null, edit: null, clip: null, fillDrag: null, drag: null, showFormulas: false,
+    touchSelection: false, touchFill: null, touches: new Map(),
     sel: { r: 0, c: 0, ranges: [{ r1: 0, c1: 0, r2: 0, c2: 0 }], anchor: { r: 0, c: 0 } },
     settings: { dec: null, lang: 'es', currency: '$', dark: false },
 
@@ -28,6 +29,7 @@
       this.grid.resize();
       this.focusGrid();
       window.addEventListener('beforeunload', () => this.saveNow());
+      document.addEventListener('visibilitychange', () => { if (document.hidden) this.saveNow(); });
       document.addEventListener('copy', (e) => this.onClipboard(e));
       document.addEventListener('cut', (e) => this.onClipboard(e));
       document.addEventListener('paste', (e) => this.onPasteEvent(e));
@@ -42,6 +44,7 @@
       if (refresh) { LS.set('hc.settings', JSON.stringify(s)); if (this.grid) { this.grid.widths.clear(); this.grid.loadTheme(); } if (this.wb) this.wb.recalcAll(); this.refreshAll(); }
     },
     setWorkbook(wb, keepClean) {
+      this.cancelTouchFill();
       if (this.edit) this.endEdit();
       this.wb = wb; this.clip = null;
       wb.selSnapshot = () => ({ sheet: this.sheet.id, r: this.sel.r, c: this.sel.c, ranges: this.sel.ranges.map(cloneR) });
@@ -71,7 +74,8 @@
       if (!this.wb) return;
       let ok = false;
       try { ok = LS.set('hc.book', JSON.stringify(this.wb.toJSON())); } catch (e) { ok = false; }
-      HC.chrome.setSaveState(ok ? 'Guardado en este navegador' : 'Sin guardado automático (libro demasiado grande): descárgalo desde Archivo');
+      const saved = window.AndroidSpreadsheet ? 'Guardado en este dispositivo' : 'Guardado en este navegador';
+      HC.chrome.setSaveState(ok ? saved : 'Sin guardado automático (libro demasiado grande): descárgalo desde Archivo');
     },
     focusGrid() { if (this.grid && !ui.dialogOpen()) this.grid.sink.focus({ preventScroll: true }); },
     afterRender() { this.positionEditor(); if (HC.charts) HC.charts.layout(); },
@@ -80,6 +84,7 @@
     activateSheet(i, keepEdit) {
       if (i < 0 || i >= this.wb.sheets.length || i === this.wb.active) return;
       if (this.edit && !keepEdit && !this.commitEdit()) return;
+      this.cancelTouchFill();
       const cur = this.sheet;
       cur.view.r = this.sel.r; cur.view.c = this.sel.c; cur.view.ranges = this.sel.ranges.map(cloneR);
       this.wb.active = i;
@@ -131,6 +136,7 @@
     },
     onSelChange() {
       if (this.clip && !this.clip.data.cut) { /* la marca de copia se mantiene */ }
+      if (this.touchFill && !HC.sameRange(this.touchFill.src, this.range)) this.cancelTouchFill();
       this.grid.invalidate();
       HC.chrome.updateSelection();
     },
@@ -223,9 +229,20 @@
       cv.addEventListener('pointermove', (e) => this.onPointerMove(e));
       cv.addEventListener('pointerup', (e) => this.onPointerUp(e));
       cv.addEventListener('pointercancel', (e) => this.onPointerUp(e));
+      cv.addEventListener('lostpointercapture', (e) => {
+        if (this.touches.has(e.pointerId)) this.onTouchEnd(e, true);
+      });
       cv.addEventListener('pointerleave', () => { if (!this.drag) this.hideTip(); });
-      cv.addEventListener('dblclick', (e) => this.onDblClick(e));
-      cv.addEventListener('contextmenu', (e) => { e.preventDefault(); this.onContextMenu(e); });
+      cv.addEventListener('dblclick', (e) => { if (!e.sourceCapabilities?.firesTouchEvents) this.onDblClick(e); });
+      cv.addEventListener('contextmenu', (e) => { e.preventDefault(); if (e.pointerType !== 'touch' && !e.sourceCapabilities?.firesTouchEvents) this.onContextMenu(e); });
+      document.addEventListener('pointerdown', () => { this._holdClick = false; }, true);
+      document.addEventListener('click', (e) => {
+        // La pulsación larga abre el menú antes de que el navegador genere el clic al levantar el dedo.
+        if (!this._holdClick || !(e.pointerType === 'touch' || e.sourceCapabilities?.firesTouchEvents)) return;
+        this._holdClick = false;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }, true);
       g.host.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
       g.sink.addEventListener('keydown', (e) => this.onKeyDown(e));
       g.sink.addEventListener('input', () => {
@@ -248,15 +265,190 @@
       if (this.grid.scrollBy(dx / this.grid.zoom, dy / this.grid.zoom)) e.preventDefault();
       this.hideTip();
     },
-    setZoom(z) { this.grid.setZoom(z); HC.chrome.updateZoom(); if (HC.charts) HC.charts.layout(); },
+    setZoom(z, point) {
+      this.grid.setZoom(z, point);
+      HC.chrome.updateZoom();
+    },
+    pinchGeometry() {
+      const [a, b] = this.touches.values(), g = this.grid;
+      const p = this.pt({ clientX: (a.x + b.x) / 2, clientY: (a.y + b.y) / 2 });
+      return { x: p.x, y: p.y, span: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)), zoom: g.zoom };
+    },
+    startPinch() {
+      const p = this.pinchGeometry();
+      this.drag = { type: 'pinch', start: p, anchor: this.grid.zoomAnchor(p.x, p.y) };
+    },
+    resizeDrag(isCol, idx, start) {
+      const sheet = this.sheet, axis = isCol ? sheet.colW : sheet.rowH;
+      return { type: 'resize', isCol, idx, start, sheet, axis, size0: axis.size(idx), raw0: axis.sizes.get(idx) };
+    },
+    moveResize(d, e) {
+      const axisPoint = d.isCol ? e.clientX : e.clientY;
+      d.size = Math.max(d.isCol ? 4 : 2, Math.round(d.size0 + (axisPoint - d.start) / this.grid.zoom));
+      if (!d.touch) d.axis.set(d.idx, d.size);
+      this.showTip((d.isCol ? 'Ancho: ' : 'Alto: ') + d.size + ' px', e.clientX + 12, e.clientY + 14);
+      this.grid.invalidate();
+    },
+    finishResize(d, canceled) {
+      this.hideTip();
+      if (!d.touch) d.axis.set(d.idx, d.raw0);
+      this.grid.invalidate();
+      if (canceled || d.sheet !== this.sheet || d.size == null || d.size === d.size0) return;
+      // Se aplica a todos los encabezados seleccionados cuando el separador pertenece a ese rango.
+      const targets = new Set([d.idx]);
+      for (const r of this.sel.ranges) {
+        const full = d.isCol ? r.r1 === 0 && r.r2 >= MAXR - 1 : r.c1 === 0 && r.c2 >= MAXC - 1;
+        const a = d.isCol ? r.c1 : r.r1, b = d.isCol ? r.c2 : r.r2;
+        if (full && d.idx >= a && d.idx <= b && b - a < 5000) for (let i = a; i <= b; i++) targets.add(i);
+      }
+      this.wb.begin('Cambiar tamaño');
+      for (const i of targets) this.wb.setSize(d.sheet, d.isCol ? 'col' : 'row', i, d.size);
+      this.wb.commit();
+    },
+    canArmTouchFill() {
+      const g = this.range;
+      return this.sel.ranges.length === 1 && g.r2 - g.r1 < MAXR - 1 && g.c2 - g.c1 < MAXC - 1;
+    },
+    armTouchFill(series) {
+      if (!this.canArmTouchFill() || (this.edit && !this.commitEdit())) return;
+      const src = cloneR(this.range);
+      this.touchFill = { src, sheet: this.sheet, mode: series ? 'series' : 'copy' };
+      this.touchSelection = true;
+      this._lastTap = null;
+      this.grid.ensureVisible(src.r2, src.c2);
+      this.grid.invalidate();
+      ui.toast('Arrastra el cuadrado verde para ' + (series ? 'continuar la serie.' : 'copiar las celdas.'), 4000);
+    },
+    cancelTouchFill() {
+      if (!this.touchFill) return false;
+      this.touchFill = null;
+      if (this.drag?.type === 'fill' && this.drag.touch) {
+        this.drag = this.fillDrag = this._lastMove = null;
+        clearInterval(this._auto);
+      }
+      this.grid.invalidate();
+      return true;
+    },
+    finishFill(d, options, canceled) {
+      const dest = this.fillDrag?.dest;
+      this.fillDrag = null;
+      if (d.touch) this.cancelTouchFill();
+      if (!canceled && dest && d.sheet === this.sheet && !HC.sameRange(dest, d.src)) {
+        this.wb.fillRange(this.sheet, d.src, dest, options);
+        this.setRange(dest, this.sel.r, this.sel.c);
+      }
+      this.grid.invalidate();
+    },
+    onTouchStart(e, hit, point) {
+      if (!this.touches.size && this.drag) return;
+      const g = this.grid, id = e.pointerId, x = e.clientX, y = e.clientY;
+      this.touches.set(id, { x, y });
+      g.canvas.setPointerCapture(id);
+      if (this.touches.size === 2) {
+        clearTimeout(this.drag?.hold);
+        clearInterval(this._auto);
+        this._lastMove = this._lastTap = null;
+        if (this.drag?.type === 'resize') this.finishResize(this.drag, true);
+        this.cancelTouchFill();
+        ui.closePopups();
+        this.startPinch();
+      }
+      if (this.touches.size > 1 || this.drag?.type === 'pinch') return;
+      const handle = g.hitHandle(point.x, point.y);
+      if (this.touchFill && handle?.fill) {
+        this.drag = { type: 'fill', touch: true, id, x, y, ...this.touchFill };
+        this.fillDrag = { dest: this.touchFill.src };
+        return;
+      }
+      const rangeHandle = !this.cancelTouchFill() && !['filter', 'vlist'].includes(hit.t) ? handle : null;
+      this.touchSelection = true;
+      g.invalidate();
+      const d = this.drag = { type: rangeHandle ? 'touch-range' : 'touch', id, x, y, hit, handle: rangeHandle, moved: false };
+      if (!(this.edit && this.canPoint()) && ['cell', 'rowhdr', 'colhdr'].includes(hit.t)) {
+        d.hold = setTimeout(() => {
+          d.held = true;
+          this._lastTap = null;
+          this.onContextMenu(e);
+        }, 550);
+      }
+    },
+    onTouchMove(e) {
+      const id = e.pointerId, d = this.drag, g = this.grid;
+      if (!d || !this.touches.has(id)) return;
+      const x = e.clientX, y = e.clientY;
+      this.touches.set(id, { x, y });
+      if (d.type === 'pinch') {
+        if (this.touches.size < 2) return;
+        const p = this.pinchGeometry();
+        this.setZoom(d.start.zoom * p.span / d.start.span, { x: p.x, y: p.y, anchor: d.anchor });
+        return;
+      }
+      if (d.id !== id || d.held) return;
+      if (d.type === 'resize') { this.moveResize(d, e); return; }
+      const dx = x - d.x, dy = y - d.y;
+      if (d.type === 'fill') {
+        if (d.moved || Math.abs(dx) + Math.abs(dy) >= 5) {
+          d.moved = true;
+          this._lastMove = { x, y };
+          this.dragTo(x, y);
+          this.autoScroll();
+        }
+        return;
+      }
+      const isCol = d.hit.t === 'colhdr';
+      const along = Math.abs(isCol ? dx : dy), across = Math.abs(isCol ? dy : dx);
+      const resize = !d.moved && d.hit.resize != null && along >= 5 && along >= across && !this.canPoint();
+      if (!resize && !d.moved && Math.abs(dx) + Math.abs(dy) < (d.handle ? 5 : 8)) return;
+      clearTimeout(d.hold);
+      this._lastTap = null;
+      d.moved = true;
+      if (resize) {
+        if (this.edit && !this.commitEdit()) return;
+        this.drag = { ...this.resizeDrag(isCol, d.hit.resize, isCol ? d.x : d.y), touch: true, id };
+        this.moveResize(this.drag, e);
+      } else if (d.handle) {
+        this._lastMove = { x, y };
+        this.dragTo(x, y);
+        this.autoScroll();
+      } else {
+        g.scrollBy(-dx / g.zoom, -dy / g.zoom);
+        d.x = x;
+        d.y = y;
+      }
+    },
+    onTouchEnd(e, canceled) {
+      const id = e.pointerId, d = this.drag;
+      if (!this.touches.delete(id)) return;
+      if (d?.type === 'pinch') {
+        if (this.touches.size >= 2) this.startPinch();
+        else if (!this.touches.size) this.drag = null;
+        return;
+      }
+      if (!d || d.id !== id) return;
+      clearTimeout(d.hold);
+      clearInterval(this._auto);
+      this.drag = this._lastMove = null;
+      if (d.type === 'resize') { this.finishResize(d, canceled); return; }
+      if (d.type === 'fill') {
+        if (canceled || d.moved) this.finishFill(d, { mode: d.mode }, canceled);
+        else { this.fillDrag = null; this.grid.invalidate(); }
+        return;
+      }
+      if (!canceled && d.held) this._holdClick = true;
+      else if (!canceled && !d.moved) this.onTouchTap(d.hit, e);
+      if (d.handle && d.moved) HC.chrome.updateSelection();
+    },
     onPointerDown(e) {
       if (e.button === 2) return;
-      const g = this.grid, pt = this.pt(e), hit = g.hit(pt.x, pt.y), sh = this.sheet;
+      const g = this.grid, pt = this.pt(e), hit = g.hit(pt.x, pt.y, e.pointerType === 'touch'), sh = this.sheet;
       ui.closePopups(); this.hideTip();
       if (HC.charts) HC.charts.select(null);
-      const pointing = this.edit && this.canPoint();
-      if (e.pointerType === 'touch') { this.drag = { type: 'touch', x: e.clientX, y: e.clientY, moved: false, hit }; g.canvas.setPointerCapture(e.pointerId); return; }
       e.preventDefault();
+      if (e.pointerType === 'touch') { this.onTouchStart(e, hit, pt); return; }
+      if (this.touches.size) return;
+      this.cancelTouchFill();
+      if (this.touchSelection) { this.touchSelection = false; g.invalidate(); }
+      const pointing = this.edit && this.canPoint();
       if (!pointing) this.focusGrid();
       const cap = () => g.canvas.setPointerCapture(e.pointerId);
       switch (hit.t) {
@@ -265,8 +457,7 @@
           const isCol = hit.t === 'colhdr', idx = isCol ? hit.c : hit.r;
           if (hit.resize != null && !pointing) {
             if (this.edit && !this.commitEdit()) return;
-            const ax = isCol ? sh.colW : sh.rowH;
-            this.drag = { type: 'resize', isCol, idx: hit.resize, start: isCol ? e.clientX : e.clientY, size0: ax.size(hit.resize), raw0: ax.sizes.get(hit.resize) };
+            this.drag = this.resizeDrag(isCol, hit.resize, isCol ? e.clientX : e.clientY);
             cap(); return;
           }
           if (pointing) { this.pointAt(isCol ? 0 : idx, isCol ? idx : 0, false, isCol ? 'col' : 'row'); this.drag = { type: 'point', line: isCol ? 'col' : 'row' }; cap(); return; }
@@ -283,7 +474,7 @@
           this.drag = { type: 'hdr', isCol, from: e.shiftKey ? (isCol ? this.sel.anchor.c : this.sel.anchor.r) : idx };
           cap(); break;
         }
-        case 'fill': if (this.edit) return; this.drag = { type: 'fill', src: cloneR(this.range) }; this.fillDrag = { dest: cloneR(this.range) }; cap(); break;
+        case 'fill': if (this.edit) return; this.drag = { type: 'fill', sheet: sh, src: cloneR(this.range) }; this.fillDrag = { dest: this.drag.src }; cap(); break;
         case 'filter': if (this.edit && !this.commitEdit()) return; HC.dlg.filterMenu(hit, e); break;
         case 'vlist': HC.dlg.validationList(hit); break;
         case 'cell': {
@@ -300,19 +491,13 @@
       }
     },
     onPointerMove(e) {
-      const g = this.grid, d = this.drag;
+      if (e.pointerType === 'touch') { this.onTouchMove(e); return; }
+      if (this.touches.size) return;
+      const d = this.drag;
       if (!d) { this.hover(e); return; }
-      if (d.type === 'touch') {
-        const dx = e.clientX - d.x, dy = e.clientY - d.y;
-        if (!d.moved && Math.abs(dx) + Math.abs(dy) < 8) return;
-        d.moved = true; g.scrollBy(-dx / g.zoom, -dy / g.zoom); d.x = e.clientX; d.y = e.clientY; return;
-      }
       if (d.type === 'resize') {
-        const sh = this.sheet, ax = d.isCol ? sh.colW : sh.rowH;
-        const size = Math.max(d.isCol ? 4 : 2, Math.round(d.size0 + ((d.isCol ? e.clientX : e.clientY) - d.start) / g.zoom));
-        ax.set(d.idx, size); d.size = size;
-        this.showTip((d.isCol ? 'Ancho: ' : 'Alto: ') + size + ' px', e.clientX + 12, e.clientY + 14);
-        g.invalidate(); return;
+        this.moveResize(d, e);
+        return;
       }
       this._lastMove = { x: e.clientX, y: e.clientY };
       this.dragTo(e.clientX, e.clientY);
@@ -320,9 +505,18 @@
     },
     dragTo(cx, cy) {
       const g = this.grid, d = this.drag, b = g.canvas.getBoundingClientRect();
+      if (d.type === 'touch-range') {
+        cx += d.handle.dx;
+        cy += d.handle.dy;
+      }
       const x = HC.clamp(cx - b.left, g.hdrW * g.zoom + 1, b.width - 2), y = HC.clamp(cy - b.top, g.hdrH * g.zoom + 1, b.height - 2);
       const r = g.rowAt(y / g.zoom), c = g.colAt(x / g.zoom);
       if (d.type === 'select') this.select(r, c, { extend: true, noScroll: true });
+      else if (d.type === 'touch-range') {
+        const anchor = d.handle;
+        const range = this.withMerges(HC.normRange({ r1: anchor.r, c1: anchor.c, r2: r, c2: c }));
+        if (!HC.sameRange(range, this.range)) this.setRange(range);
+      }
       else if (d.type === 'point') this.pointAt(r, c, true, d.line);
       else if (d.type === 'hdr') {
         const s = this.sel, a = d.from, i = d.isCol ? c : r;
@@ -343,43 +537,57 @@
         if (!this.drag || !this._lastMove) { clearInterval(this._auto); return; }
         const b = g.canvas.getBoundingClientRect(), m = this._lastMove;
         let dx = 0, dy = 0;
-        if (m.x > b.right - 6) dx = 40; else if (m.x < b.left + g.hdrW * g.zoom) dx = -40;
-        if (m.y > b.bottom - 6) dy = 24; else if (m.y < b.top + g.hdrH * g.zoom) dy = -24;
+        const edge = d.type === 'touch-range' || d.touch ? 18 : 6;
+        if (m.x > b.right - edge) dx = 40; else if (m.x < b.left + g.hdrW * g.zoom) dx = -40;
+        if (m.y > b.bottom - edge) dy = 24; else if (m.y < b.top + g.hdrH * g.zoom) dy = -24;
         if (this.drag.type === 'hdr') { if (this.drag.isCol) dy = 0; else dx = 0; }
         if ((dx || dy) && g.scrollBy(dx, dy)) this.dragTo(m.x, m.y); else if (!dx && !dy) clearInterval(this._auto);
       }, 50);
     },
     onPointerUp(e) {
+      if (e.pointerType === 'touch') { this.onTouchEnd(e, e.type === 'pointercancel'); return; }
+      if (this.touches.size) return;
       const d = this.drag;
       if (!d) return;
       clearInterval(this._auto);
       this.drag = null; this._lastMove = null;
       const g = this.grid;
       try { g.canvas.releasePointerCapture(e.pointerId); } catch (err) { /* ya liberado */ }
-      if (d.type === 'touch') { if (!d.moved && d.hit.t === 'cell') { if (this.edit && !this.commitEdit()) return; this.select(d.hit.r, d.hit.c); this.focusGrid(); } return; }
       if (d.type === 'resize') {
-        this.hideTip();
-        const sh = this.sheet, ax = d.isCol ? sh.colW : sh.rowH;
-        if (d.size == null || d.size === d.size0) { ax.set(d.idx, d.raw0); g.invalidate(); return; }
-        ax.set(d.idx, d.raw0);
-        // si la fila o columna forma parte de una selección de filas/columnas completas, se cambian todas
-        const targets = new Set([d.idx]);
-        for (const r of this.sel.ranges) {
-          const full = d.isCol ? r.r1 === 0 && r.r2 >= MAXR - 1 : r.c1 === 0 && r.c2 >= MAXC - 1;
-          const a = d.isCol ? r.c1 : r.r1, b = d.isCol ? r.c2 : r.r2;
-          if (full && d.idx >= a && d.idx <= b && b - a < 5000) for (let i = a; i <= b; i++) targets.add(i);
-        }
-        this.wb.begin('Cambiar tamaño');
-        for (const i of targets) this.wb.setSize(sh, d.isCol ? 'col' : 'row', i, d.size);
-        this.wb.commit();
+        this.finishResize(d, e.type === 'pointercancel');
         return;
       }
       if (d.type === 'fill') {
-        const dest = this.fillDrag.dest; this.fillDrag = null;
-        if (!HC.sameRange(dest, d.src)) { this.wb.fillRange(this.sheet, d.src, dest, { series: e.ctrlKey }); this.setRange(dest, this.sel.r, this.sel.c); }
-        g.invalidate();
+        this.finishFill(d, { series: e.ctrlKey }, e.type === 'pointercancel');
       }
       if (d.type === 'point') this.focusEditor();
+    },
+    onTouchTap(hit, e) {
+      const g = this.grid;
+      const last = this._lastTap;
+      this._lastTap = null;
+      const line = hit.t === 'colhdr' ? 'col' : hit.t === 'rowhdr' ? 'row' : null;
+      if ((line || hit.t === 'cell') && this.canPoint()) {
+        this.pointAt(hit.r ?? 0, hit.c ?? 0, false, line);
+        this.focusEditor();
+        return;
+      }
+      if (this.edit && !this.commitEdit()) return;
+      if (hit.t === 'cell') {
+        this.select(hit.r, hit.c, { noScroll: true });
+        if (last && last.r === hit.r && last.c === hit.c && e.timeStamp - last.time < 400) {
+          this.startEdit(null, { mode: 'edit', where: window.AndroidSpreadsheet ? 'cell' : 'bar' });
+        } else {
+          this._lastTap = { r: hit.r, c: hit.c, time: e.timeStamp };
+          this.focusGrid();
+        }
+      } else if (line === 'col') {
+        this.setRange({ r1: 0, r2: MAXR - 1, c1: hit.c, c2: hit.c }, g.rowAt(g.hdrH + 1), hit.c);
+      } else if (line === 'row') {
+        this.setRange({ c1: 0, c2: MAXC - 1, r1: hit.r, r2: hit.r }, hit.r, g.colAt(g.hdrW + 1));
+      } else if (hit.t === 'corner') this.selectAll();
+      else if (hit.t === 'filter') HC.dlg.filterMenu(hit);
+      else if (hit.t === 'vlist') HC.dlg.validationList(hit);
     },
     onDblClick(e) {
       const g = this.grid, pt = this.pt(e), hit = g.hit(pt.x, pt.y), sh = this.sheet;
@@ -432,7 +640,9 @@
       if (typeof url !== 'string' || !url) return;
       if (url[0] === '#') { this.goTo(url.slice(1)); return; }
       if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url;
-      if (/^(https?|mailto|tel):/i.test(url)) window.open(url, '_blank', 'noopener');
+      if (!/^(https?|mailto|tel):/i.test(url)) return;
+      if (window.AndroidSpreadsheet) window.AndroidSpreadsheet.openLink(url);
+      else window.open(url, '_blank', 'noopener');
     },
     onContextMenu(e) {
       const g = this.grid, pt = this.pt(e), hit = g.hit(pt.x, pt.y);
@@ -541,7 +751,7 @@
           const al = st.ha || (x && typeof x.v === 'number' ? 'r' : null);
           if (al) css.push('text-align:' + (al === 'r' ? 'right' : al === 'c' ? 'center' : 'left'));
           for (const [k, side] of [['bt', 'top'], ['bb', 'bottom'], ['bl', 'left'], ['br', 'right']]) if (st[k]) css.push('border-' + side + ':1px solid ' + (st[k].split(' ')[1] || '#000'));
-          out += '<td' + (css.length ? ' style="' + css.join(';') + '"' : '') + '>' + esc(matrix[i][j]).replace(/\n/g, '<br>') + '</td>';
+          out += '<td' + (css.length ? ' style="' + esc(css.join(';')) + '"' : '') + '>' + esc(matrix[i][j]).replace(/\n/g, '<br>') + '</td>';
         }
         out += '</tr>';
       }
@@ -569,6 +779,7 @@
         const wasCut = this.clip.data.cut;
         res = this.wb.pasteData(sh, g.r1, g.c1, this.clip.data, { mode: opts.mode, transpose: opts.transpose, target: g });
         if (wasCut) this.clip = null;
+        else if (res && window.AndroidSpreadsheet) this.clip.show = false;
       } else {
         let matrix = null;
         if (text) matrix = HC.csv.parse(norm(text), '\t');
@@ -587,7 +798,9 @@
       opts = opts || {};
       if (opts.mode || opts.transpose) { if (!this.clip) { ui.toast('Primero copia las celdas que quieres pegar.'); return; } this.pasteFrom('', '', Object.assign({ internal: true }, opts)); return; }
       let text = null;
-      try { text = await navigator.clipboard.readText(); } catch (e) { text = null; }
+      try {
+        text = window.AndroidSpreadsheet ? window.AndroidSpreadsheet.pasteText() : await navigator.clipboard.readText();
+      } catch (e) { text = null; }
       if (text != null && text !== '') this.pasteFrom(text, '', {});
       else if (this.clip) this.pasteFrom('', '', { internal: true });
       else ui.toast('El navegador no permite leer el portapapeles desde el menú. Usa Ctrl + V.');
@@ -595,7 +808,10 @@
     async copyMenu(cut) {
       const c = this.copySelection(cut);
       if (!c) return;
-      try { await navigator.clipboard.writeText(c.text); } catch (e) { /* queda disponible para pegar dentro de la app */ }
+      try {
+        if (window.AndroidSpreadsheet) window.AndroidSpreadsheet.copyText(c.text);
+        else await navigator.clipboard.writeText(c.text);
+      } catch (e) { /* queda disponible para pegar dentro de la app */ }
     },
 
     // ------------------------------------------------------------ comandos
@@ -697,10 +913,14 @@
       sortAsc() { this.quickSort(false); }, sortDesc() { this.quickSort(true); },
       toggleFilter() {
         const sh = this.sheet;
-        if (sh.filter) { this.wb.setFilter(sh, null); return; }
-        const g = this.dataRegion();
-        if (!g) { ui.toast('Selecciona una celda dentro de la tabla que quieres filtrar.'); return; }
-        this.wb.setFilter(sh, { range: g, cols: {} });
+        if (sh.filter) { this.wb.setFilter(sh, null); ui.toast('Filtro desactivado.'); return; }
+        const selection = this.range;
+        const inferred = selection.r1 === selection.r2 && selection.c1 === selection.c2;
+        const g = inferred ? this.dataRegion() : HC.clipBig(sh, selection);
+        if (!g || g.r1 >= Math.min(g.r2, sh.maxR)) { ui.toast('Selecciona un rango con encabezados y al menos una fila de datos.'); return; }
+        this.wb.setFilter(sh, { range: g, cols: {}, autoExpand: inferred });
+        this.grid.ensureVisible(g.r1, HC.clamp(this.sel.c, g.c1, g.c2));
+        ui.toast('Toca o haz clic en la flecha de un encabezado para filtrar.');
       },
       autoSum(fn) {
         const sh = this.sheet, s = this.sel, g = this.range, name = HC.fnToLocal(fn || 'SUM');
@@ -737,9 +957,11 @@
       goalSeek() { HC.dlg.goalSeek(); },
       settings() { HC.dlg.settings(); },
       shortcuts() { HC.dlg.shortcuts(); },
+      touchHelp() { HC.dlg.touchHelp(); },
+      about() { HC.dlg.about(); },
       rowHeight() { HC.dlg.size(false); }, colWidth() { HC.dlg.size(true); },
       newBook() { HC.files.newBook(); }, open() { HC.files.open(); }, saveXlsx() { HC.files.saveXlsx(); }, saveJson() { HC.files.saveJson(); },
-      exportCsv() { HC.files.exportCsv(); }, print() { HC.files.print(); }, example() { HC.files.example(); },
+      exportCsv() { HC.files.exportCsv(); }, savePdf() { HC.files.savePdf(); }, print() { HC.files.print(); }, example() { HC.files.example(); },
     },
     fitRows() {
       const sh = this.sheet;
@@ -785,4 +1007,5 @@
   });
   HC.clipRange = (g) => HC.clipBig(app.sheet, g);
   for (const k of ['toggleFormulas', 'zoom', 'darkMode', 'settings', 'shortcuts']) app.noCommit[k] = true;
+  window.addEventListener('DOMContentLoaded', () => app.init());
 })();

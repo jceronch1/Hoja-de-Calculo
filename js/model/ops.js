@@ -295,7 +295,7 @@
     return (k) => r12(b + m * k);
   }
   // items: [{f, v, s, nf}] de la serie origen. Devuelve gen(k) -> {f, v, s} para cualquier índice k.
-  function seriesGen(items, lineShift, inc) {
+  function seriesGen(items, lineShift, opts) {
     const n = items.length;
     const idx = (k) => ((k % n) + n) % n;
     const pattern = (k) => { const it = items[idx(k)]; return { v: it.v, s: it.s }; };
@@ -303,11 +303,13 @@
     if (items.some((it) => it.f != null)) {
       return (k) => { const it = items[idx(k)]; return it.f != null ? { f: lineShift(it.f, k - idx(k)), s: it.s } : { v: it.v, s: it.s }; };
     }
+    if (opts.mode === 'copy') return pattern;
     if (items.every((it) => typeof it.v === 'number')) {
       const vals = items.map((it) => it.v);
       if (n === 1) {
-        const isDate = items[0].nf && HC.fmt.kind(items[0].nf) === 'date';
-        return (isDate && !inc) || (!isDate && inc) ? withStyle((k) => vals[0] + k) : pattern;
+        const isDate = !!items[0].nf && HC.fmt.kind(items[0].nf) === 'date';
+        const increment = opts.mode === 'series' || isDate !== !!opts.series;
+        return increment ? withStyle((k) => vals[0] + k) : pattern;
       }
       return withStyle(linear(vals));
     }
@@ -333,12 +335,12 @@
     }
     return pattern;
   }
-  // Rellena dest (que contiene a src y se extiende en un sentido). opts.series alterna copiar/incrementar.
-  W.fillRange = function (sh, src, dest, opts) {
+  // Rellena dest, que contiene a src y se extiende en un sentido.
+  // mode elige copiar o continuar una serie. series conserva el comportamiento del arrastre con Ctrl.
+  W.fillRange = function (sh, src, dest, opts = {}) {
     const vertical = dest.r1 < src.r1 || dest.r2 > src.r2;
     if (!vertical && !(dest.c1 < src.c1 || dest.c2 > src.c2)) return;
     this.begin('Rellenar');
-    const inc = !!(opts && opts.series);
     const lines = vertical ? cols(src) : rows(src), n = vertical ? rows(src) : cols(src);
     for (let L = 0; L < lines; L++) {
       const items = [];
@@ -347,7 +349,7 @@
         const cell = sh.get(r, c), st = sh.styleAt(r, c);
         items.push({ f: cell && cell.f != null ? cell.f : undefined, v: cell && !cell.g ? cell.v : cell ? cell.v : null, s: st, nf: st && st.nf });
       }
-      const gen = seriesGen(items, (f, d) => (vertical ? HC.shiftFormula(f, d, 0) : HC.shiftFormula(f, 0, d)), inc);
+      const gen = seriesGen(items, (f, d) => (vertical ? HC.shiftFormula(f, d, 0) : HC.shiftFormula(f, 0, d)), opts || {});
       const from = vertical ? dest.r1 - src.r1 : dest.c1 - src.c1, to = vertical ? dest.r2 - src.r1 : dest.c2 - src.c1;
       for (let k = from; k <= to; k++) {
         if (k >= 0 && k < n) continue;
@@ -435,12 +437,13 @@
   };
 
   // ---------------------------------------------------------------- filtro automático
-  // sh.filter = {range, cols: {desplazamiento: {hidden: [textos ocultos]} | {op, v1, v2}}}
+  // sh.filter.cols guarda valores permitidos, textos excluidos de libros antiguos o una condición.
   W.filterBounds = function (sh) {
     const f = sh.filter;
     if (!f) return null;
     const g = f.range;
-    let r2 = Math.min(g.r2, Math.max(sh.maxR, g.r1));
+    if (f.autoExpand === false) return g;
+    let r2 = g.r2;
     // se extiende hacia abajo mientras haya datos
     for (let r = r2 + 1; r <= sh.maxR; r++) {
       let any = false;
@@ -450,64 +453,91 @@
     }
     return { r1: g.r1, c1: g.c1, r2, c2: g.c2 };
   };
-  function condTest(spec, v, text) {
-    const num = (x) => { const p = HC.parseInput(String(x == null ? '' : x)); return typeof p.v === 'number' ? p.v : null; };
-    const a = num(spec.v1), b = num(spec.v2), low = text.toLowerCase(), s1 = String(spec.v1 == null ? '' : spec.v1).toLowerCase();
-    const cmpN = (fn) => typeof v === 'number' && a != null && fn(v, a);
+  const filterValue = (v) => v == null ? '' : String(v);
+  function conditionTest(spec) {
+    const num = (x) => typeof x === 'number' ? x : HC.textToNumber(x ?? '');
+    const a = num(spec.v1), b = num(spec.v2), term = String(spec.v1 ?? '').toLowerCase();
+    const cmp = (f) => (v) => typeof v === 'number' && a != null && f(v, a);
+    const equals = (v, text) => a != null && typeof v === 'number' ? v === a : text.toLowerCase() === term;
     switch (spec.op) {
-      case 'eq': return a != null && typeof v === 'number' ? v === a : low === s1;
-      case 'neq': return !(a != null && typeof v === 'number' ? v === a : low === s1);
-      case 'gt': return cmpN((x, y) => x > y);
-      case 'gte': return cmpN((x, y) => x >= y);
-      case 'lt': return cmpN((x, y) => x < y);
-      case 'lte': return cmpN((x, y) => x <= y);
-      case 'between': return typeof v === 'number' && a != null && b != null && v >= Math.min(a, b) && v <= Math.max(a, b);
-      case 'contains': return low.indexOf(s1) >= 0;
-      case 'ncontains': return low.indexOf(s1) < 0;
-      case 'begins': return low.startsWith(s1);
-      case 'ends': return low.endsWith(s1);
-      case 'blank': return text === '';
-      case 'nblank': return text !== '';
+      case 'eq': return equals;
+      case 'neq': return (v, text) => !equals(v, text);
+      case 'gt': return cmp((x, y) => x > y);
+      case 'gte': return cmp((x, y) => x >= y);
+      case 'lt': return cmp((x, y) => x < y);
+      case 'lte': return cmp((x, y) => x <= y);
+      case 'between': return (v) => typeof v === 'number' && a != null && b != null && v >= Math.min(a, b) && v <= Math.max(a, b);
+      case 'contains': return (_, text) => text.toLowerCase().includes(term);
+      case 'ncontains': return (_, text) => !text.toLowerCase().includes(term);
+      case 'begins': return (_, text) => text.toLowerCase().startsWith(term);
+      case 'ends': return (_, text) => text.toLowerCase().endsWith(term);
+      case 'blank': return (v) => filterValue(v) === '';
+      case 'nblank': return (v) => filterValue(v) !== '';
+      default: return () => true;
     }
-    return true;
   }
-  HC.condTest = condTest;
+  HC.condTest = (spec, v, text) => conditionTest(spec)(v, text);
+  HC.filterTest = function (spec) {
+    if (Array.isArray(spec.values)) {
+      const values = new Set(spec.values.map((v) => filterValue(v).toLowerCase()));
+      return (v, display) => values.has(filterValue(v).toLowerCase())
+        || (spec.matchDisplay && values.has(display().toLowerCase()));
+    }
+    if (Array.isArray(spec.hidden)) {
+      const hidden = new Set(spec.hidden);
+      return (_, display) => !hidden.has(display());
+    }
+    const test = conditionTest(spec);
+    const needsText = !['gt', 'gte', 'lt', 'lte', 'between', 'blank', 'nblank'].includes(spec.op);
+    return needsText ? (v, display) => test(v, display()) : (v) => test(v);
+  };
   W.applyFilter = function (sh) {
     const set = new Set(), f = sh.filter;
     if (f && f.cols) {
       const g = this.filterBounds(sh);
-      const specs = Object.keys(f.cols).map((k) => ({ c: g.c1 + +k, spec: f.cols[k], hidden: f.cols[k].hidden ? new Set(f.cols[k].hidden) : null }));
+      const specs = Object.entries(f.cols).map(([k, spec]) => ({ c: g.c1 + +k, test: HC.filterTest(spec) }));
       if (specs.length) for (let r = g.r1 + 1; r <= g.r2; r++) {
         for (const s of specs) {
-          const text = this.displayText(sh, r, s.c);
-          if (s.hidden ? s.hidden.has(text) : !condTest(s.spec, sh.value(r, s.c), text)) { set.add(r); break; }
+          if (!s.test(sh.value(r, s.c), () => this.displayText(sh, r, s.c))) { set.add(r); break; }
         }
       }
     }
+    const previous = sh.rowH.filtered;
+    if (set.size === previous.size) {
+      let same = true;
+      for (const r of set) if (!previous.has(r)) { same = false; break; }
+      if (same) return false;
+    }
     sh.rowH.filtered = set; sh.rowH.touch();
+    return true;
   };
-  W.refreshFilters = function () { for (const sh of this.sheets) if (sh.filter || sh.rowH.filtered.size) this.applyFilter(sh); };
+  W.refreshFilters = function () {
+    let changed = false;
+    for (const sh of this.sheets) {
+      if ((sh.filter || sh.rowH.filtered.size) && this.applyFilter(sh)) changed = true;
+    }
+    return changed;
+  };
   W.setFilter = function (sh, filter) {
     this.begin('Filtro');
     this.setProp(sh, 'filter', filter);
-    this.applyFilter(sh);
     this.commit();
   };
   W.setFilterCol = function (sh, offset, spec) {
     if (!sh.filter) return;
     const colsMap = Object.assign({}, sh.filter.cols || {});
     if (spec) colsMap[offset] = spec; else delete colsMap[offset];
-    this.setFilter(sh, { range: sh.filter.range, cols: colsMap });
+    this.setFilter(sh, { ...sh.filter, cols: colsMap });
   };
   // valores distintos de una columna del filtro (para la lista desplegable)
   W.filterItems = function (sh, offset) {
     const g = this.filterBounds(sh), c = g.c1 + offset, map = new Map();
     for (let r = g.r1 + 1; r <= g.r2; r++) {
-      const text = this.displayText(sh, r, c);
-      if (!map.has(text)) map.set(text, sh.value(r, c));
+      const v = sh.value(r, c), key = filterValue(v), text = this.displayText(sh, r, c);
+      if (!map.has(key.toLowerCase())) map.set(key.toLowerCase(), { text, v, key });
     }
     const cmp = HC.fx.sortCmp;
-    return Array.from(map, ([text, v]) => ({ text, v })).sort((a, b) => (a.v == null ? 1 : b.v == null ? -1 : cmp(a.v, b.v)));
+    return Array.from(map.values()).sort((a, b) => (a.key === '' ? 1 : b.key === '' ? -1 : cmp(a.v, b.v)));
   };
 
   // ---------------------------------------------------------------- formato condicional

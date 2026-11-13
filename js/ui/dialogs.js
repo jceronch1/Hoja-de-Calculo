@@ -20,34 +20,137 @@
     // ------------------------------------------------------------ filtro automático
     filterMenu(hit) {
       const a = A(), sh = a.sheet, wb = a.wb, off = hit.off;
-      const items = wb.filterItems(sh, off), cur = (sh.filter.cols || {})[off] || null;
-      const hidden = new Set(cur && cur.hidden ? cur.hidden : []);
-      const list = h('div.list');
-      const all = ui.check('(Seleccionar todo)', hidden.size === 0, (on) => { for (const c of checks) if (!c.row.hidden) { c.input.checked = on; } });
-      const checks = items.map((it) => { const c = ui.check(it.text === '' ? '(Vacías)' : it.text, !hidden.has(it.text)); c.classList.add('list-item'); return { row: c, input: c.input, text: it.text }; });
-      list.append(all, ...checks.map((c) => c.row));
+      const bounds = wb.filterBounds(sh);
+      if (!bounds) return;
+      const col = bounds.c1 + off, current = (sh.filter.cols || {})[off];
+      const title = wb.displayText(sh, bounds.r1, col) || 'Columna ' + HC.colName(col);
+      const items = wb.filterItems(sh, off);
+      const passes = current && !current.op ? HC.filterTest(current) : () => true;
+      const checked = new Set(items.filter(({ v, text }) => passes(v, () => text)).map(({ key }) => key));
+      const fold = (text) => HC.fold(text).toLowerCase();
+      for (const item of items) {
+        item.label = item.text || (item.key === '' ? '(Vacías)' : item.key);
+        item.searchText = fold(item.label + ' ' + item.key);
+      }
+
       const search = h('input.inp', { type: 'search', placeholder: 'Buscar valores…', 'aria-label': 'Buscar valores' });
-      search.addEventListener('input', () => { const q = search.value.toLowerCase(); for (const c of checks) c.row.hidden = q !== '' && c.text.toLowerCase().indexOf(q) < 0; });
-      const condOps = [['', 'Sin condición'], ['eq', 'Es igual a'], ['neq', 'No es igual a'], ['gt', 'Mayor que'], ['gte', 'Mayor o igual que'], ['lt', 'Menor que'], ['lte', 'Menor o igual que'], ['between', 'Entre'], ['contains', 'Contiene'], ['ncontains', 'No contiene'], ['begins', 'Empieza por'], ['ends', 'Termina en'], ['blank', 'Está vacía'], ['nblank', 'No está vacía']];
-      const v1 = h('input.inp', { type: 'text', value: (cur && cur.v1) || '', 'aria-label': 'Valor' }), v2 = h('input.inp', { type: 'text', value: (cur && cur.v2) || '', 'aria-label': 'Segundo valor' });
-      const opSel = ui.select(condOps, (cur && cur.op) || '', () => sync());
-      const sync = () => { const o = opSel.value; v1.hidden = !o || o === 'blank' || o === 'nblank'; v2.hidden = o !== 'between'; list.style.opacity = o ? 0.45 : 1; };
-      const bounds = wb.filterBounds(sh), col = bounds.c1 + off;
-      const sortBtn = (desc) => h('button.btn.small', { type: 'button', onclick: () => { ui.closePopups(); wb.sortRange(sh, bounds, [{ col, desc }], true); wb.applyFilter(sh); a.grid.invalidate(); } }, ui.icon(desc ? 'sortDesc' : 'sortAsc'), desc ? ' Z → A' : ' A → Z');
+      const list = h('div.list.filter-values', { role: 'group', 'aria-label': 'Valores de ' + title });
+      const rows = h('div');
+      const pageSize = 250;
+      let matching = items, limit = pageSize, shown = [];
+      const all = ui.check('Seleccionar todo', true, (on) => {
+        for (const { key } of matching) {
+          if (on) checked.add(key); else checked.delete(key);
+        }
+        for (const [key, input] of shown) input.checked = checked.has(key);
+        syncChecks();
+      });
+      all.classList.add('filter-all');
+      list.append(all, rows);
+
+      function syncChecks() {
+        const total = matching.length, selected = matching.reduce((n, { key }) => n + Number(checked.has(key)), 0);
+        all.input.checked = total > 0 && selected === total;
+        all.input.indeterminate = selected > 0 && selected < total;
+        all.input.disabled = total === 0;
+      }
+      function renderValues() {
+        const page = matching.slice(0, limit);
+        shown = [];
+        rows.replaceChildren(...page.map(({ key, label }) => {
+          const entry = ui.check(label, checked.has(key), (on) => {
+            if (on) checked.add(key); else checked.delete(key);
+            syncChecks();
+          });
+          entry.classList.add('list-item');
+          entry.title = label;
+          shown.push([key, entry.input]);
+          return entry;
+        }));
+        if (matching.length > limit) {
+          rows.append(h('button.btn.small', { type: 'button', onclick: () => { limit += pageSize; renderValues(); } }, 'Mostrar más valores'));
+        } else if (!matching.length) rows.append(h('div.list-item.muted', 'No hay coincidencias.'));
+        syncChecks();
+      }
+      search.addEventListener('input', () => {
+        const query = fold(search.value.trim());
+        matching = query ? items.filter(({ searchText }) => searchText.includes(query)) : items;
+        limit = pageSize;
+        list.scrollTop = 0;
+        renderValues();
+      });
+
+      const condOps = [['', 'Usar valores seleccionados'], ...OPS.filter(([op]) => op !== 'nbetween'),
+        ['contains', 'Contiene'], ['ncontains', 'No contiene'], ['begins', 'Empieza por'], ['ends', 'Termina en'],
+        ['blank', 'Está vacía'], ['nblank', 'No está vacía']];
+      const condition = ui.select(condOps, current?.op || '', () => syncCondition());
+      condition.setAttribute('aria-label', 'Condición');
+      const conditionValue = (v) => typeof v === 'number' && HC.locale.dec === ',' ? String(v).replace('.', ',') : v ?? '';
+      const v1 = h('input.inp', { type: 'text', value: conditionValue(current?.v1), placeholder: 'Valor', 'aria-label': 'Valor' });
+      const v2 = h('input.inp', { type: 'text', value: conditionValue(current?.v2), placeholder: 'Segundo valor', 'aria-label': 'Segundo valor' });
+      const error = h('p.filter-error', { role: 'status', hidden: true });
+      const values = h('div.filter-selection', search, list);
+      function syncCondition() {
+        const op = condition.value;
+        v1.hidden = !op || op === 'blank' || op === 'nblank';
+        v2.hidden = op !== 'between';
+        const keyboard = ['gt', 'gte', 'lt', 'lte', 'between'].includes(op) ? 'decimal' : 'text';
+        v1.inputMode = keyboard; v2.inputMode = keyboard;
+        values.hidden = !!op;
+        error.hidden = true;
+      }
       const apply = () => {
-        ui.closePopups();
+        const op = condition.value;
         let spec = null;
-        if (opSel.value) spec = { op: opSel.value, v1: v1.value, v2: v2.value };
-        else { const hid = checks.filter((c) => !c.input.checked).map((c) => c.text); if (hid.length) spec = { hidden: hid }; }
+        if (op) {
+          let first = v1.value, second = v2.value;
+          if (['gt', 'gte', 'lt', 'lte', 'between'].includes(op)) {
+            first = num(first);
+            second = op === 'between' ? num(second) : null;
+            if (first == null || (op === 'between' && second == null)) {
+              error.textContent = op === 'between' ? 'Escribe dos números válidos.' : 'Escribe un número válido.';
+              error.hidden = false;
+              return;
+            }
+            if (op === 'between' && first > second) [first, second] = [second, first];
+          } else if ((op === 'eq' || op === 'neq') && items.some(({ v }) => typeof v === 'number')) {
+            first = num(first) ?? first;
+          }
+          spec = { op, v1: first, v2: second };
+        } else {
+          if (!matching.length && search.value.trim()) return;
+          const allowed = matching.filter(({ key }) => checked.has(key)).map(({ key }) => key);
+          if (allowed.length !== items.length) spec = { values: allowed };
+        }
+        ui.closePopups();
         wb.setFilterCol(sh, off, spec);
       };
-      const el = h('div.filter-pop', h('div.filter-actions', { style: { justifyContent: 'flex-start' } }, sortBtn(false), sortBtn(true)), opSel, v1, v2, search, list,
-        h('div.filter-actions', h('button.btn.small', { type: 'button', onclick: () => { ui.closePopups(); wb.setFilterCol(sh, off, null); } }, 'Borrar filtro'), h('button.btn.small.primary', { type: 'button', onclick: apply }, 'Aceptar')));
-      el.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') apply(); else if (e.key === 'Escape') { ui.closePopups(); a.focusGrid(); } });
-      sync();
+      const sortBtn = (desc) => h('button.filter-command', { type: 'button', onclick: () => {
+        ui.closePopups();
+        if (bounds.r2 - bounds.r1 < 2) return;
+        if (!wb.sortRange(sh, bounds, [{ col, desc }], true)) ui.toast('No se puede ordenar un rango con celdas combinadas.');
+      } }, ui.icon(desc ? 'sortDesc' : 'sortAsc'), desc ? 'Ordenar de mayor a menor' : 'Ordenar de menor a mayor');
+      const clear = h('button.filter-command', { type: 'button', disabled: !current, onclick: () => {
+        ui.closePopups();
+        wb.setFilterCol(sh, off, null);
+      } }, ui.icon('filter'), 'Borrar filtro');
+      const advanced = h('details.filter-condition', { open: !!current?.op }, h('summary', 'Filtrar por condición'),
+        h('div.filter-condition-fields', condition, v1, v2, error));
+      const el = h('div.filter-pop', { role: 'dialog', 'aria-label': 'Filtrar ' + title, tabIndex: -1 },
+        h('strong.filter-title', title), h('div.filter-commands', sortBtn(false), sortBtn(true), clear), advanced, values,
+        h('div.filter-actions', h('button.btn.small', { type: 'button', onclick: () => ui.closePopups() }, 'Cancelar'),
+          h('button.btn.small.primary', { type: 'button', onclick: apply }, 'Aceptar')));
+      el.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter' && e.target.matches('input:not([type=checkbox])')) { e.preventDefault(); apply(); }
+        else if (e.key === 'Escape') { e.preventDefault(); ui.closePopups(); }
+      });
+      renderValues();
+      syncCondition();
       const b = a.grid.canvas.getBoundingClientRect(), z = a.grid.zoom;
-      ui.popup(el, { x: b.left + hit.x * z, y: b.top + (hit.y + hit.h) * z + 2 }, { onClose: () => a.focusGrid() });
-      search.focus();
+      ui.popup(el, { x: b.left + hit.x * z, y: b.top + (hit.y + hit.h) * z + 2 },
+        { onClose: () => a.focusGrid(), keepOnResize: true });
+      el.focus({ preventScroll: true });
     },
     validationList(hit) {
       const a = A(), sh = a.sheet, rule = a.wb.validationAt(sh, hit.r, hit.c);
@@ -517,6 +620,23 @@
       const curr = h('input.inp', { type: 'text', value: s.currency || '$', maxlength: 4, style: { width: '90px' } });
       ui.dialog({ title: 'Configuración', width: 440, body: h('div', ui.field('Separador decimal', dec, 'Afecta a cómo se escriben y se muestran los números y las fórmulas.'), ui.field('Nombres de las funciones', lang, 'Al escribir se aceptan los dos idiomas; aquí eliges cómo se muestran.'), ui.field('Símbolo de moneda', curr)),
         buttons: [{ label: 'Cancelar' }, { label: 'Guardar', primary: true, action: () => { s.dec = dec.value || null; s.lang = lang.value; s.currency = curr.value.trim() || '$'; a.applySettings(true); } }] });
+    },
+    touchHelp() {
+      const steps = [
+        ['Seleccionar celdas', 'Toca una celda y arrastra uno de los tiradores verdes para seleccionar un rango.'],
+        ['Editar una celda', 'Tócala dos veces para escribir dentro de ella. También puedes tocar la barra de fórmulas. Usa ✓ para aceptar.'],
+        ['Autorrellenar', 'Selecciona las celdas de origen, mantén pulsada la selección y elige Autorrellenar con el dedo › Continuar serie o Copiar celdas. Arrastra el tirador cuadrado y suelta para aplicar.'],
+        ['Cambiar el tamaño', 'Arrastra con un dedo la línea entre dos letras para ajustar la columna de la izquierda, o la línea entre dos números para ajustar la fila de arriba. Suelta para aplicar el cambio.'],
+        ['Desplazarte y cambiar el zoom', 'Desliza un dedo por la cuadrícula para moverte. Junta o separa dos dedos para cambiar el zoom. También puedes elegir 25 % en Ver › Zoom.'],
+        ['Filtrar datos', 'Selecciona el rango con sus encabezados, activa Datos › Filtro y toca la flecha de la columna.'],
+        ['Abrir y guardar archivos', 'Usa Archivo › Abrir o Archivo › Guardar como para elegir Excel, PDF u otro formato.'],
+      ];
+      const body = h('div.touch-help', steps.map(([title, instruction]) =>
+        h('section', h('h3', title), h('p', instruction))));
+      ui.dialog({ title: 'Gestos y acciones', width: 460, body });
+    },
+    about() {
+      ui.alert('Creador: PhD Jhoni cerón', 'Acerca de');
     },
     shortcuts() {
       const rows = [

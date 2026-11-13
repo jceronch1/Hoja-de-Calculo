@@ -7,7 +7,7 @@
   const app = () => HC.app;
   const run = (name, arg) => () => HC.app.run(name, arg);
   const SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
-  const ZOOMS = [50, 75, 90, 100, 110, 125, 150, 200];
+  const ZOOMS = [25, 50, 75, 90, 100, 110, 125, 150, 200];
   const CHARTS = [['column', 'Columnas'], ['bar', 'Barras'], ['line', 'Líneas'], ['area', 'Áreas'], ['pie', 'Circular'], ['doughnut', 'Anillo'], ['scatter', 'Dispersión'], ['bubble', 'Burbujas'], ['radar', 'Radial'], ['combo', 'Combinada'], ['histogram', 'Histograma']];
   HC.CHART_TYPES = CHARTS;
 
@@ -22,8 +22,8 @@
       this.saveState = h('span#save-state', { 'aria-live': 'polite' });
       this.menubar = h('nav#menubar', { role: 'menubar', 'aria-label': 'Menú principal' });
       this.toolbar = h('div#toolbar', { role: 'toolbar', 'aria-label': 'Barra de herramientas' });
-      this.nameBox = h('input#namebox', { type: 'text', 'aria-label': 'Cuadro de nombres: celda activa', spellcheck: false, autocomplete: 'off' });
-      this.fx = h('textarea#fx-input', { rows: 1, spellcheck: false, autocomplete: 'off', autocapitalize: 'off', 'aria-label': 'Barra de fórmulas' });
+      this.nameBox = h('input#namebox', { type: 'text', 'aria-label': 'Cuadro de nombres: celda activa', spellcheck: false, autocomplete: 'off', enterkeyhint: 'go' });
+      this.fx = h('textarea#fx-input', { rows: 1, spellcheck: false, autocomplete: 'off', autocapitalize: 'off', enterkeyhint: 'done', 'aria-label': 'Barra de fórmulas' });
       this.cancelBtn = this.tbButton('close', 'Cancelar (Esc)', () => app().cancelEdit());
       this.okBtn = this.tbButton('check', 'Aceptar (Intro)', () => app().commitEdit());
       const fxBtn = this.tbButton('fx', 'Insertar función', run('insertFunction'));
@@ -79,15 +79,25 @@
     menus() {
       const a = app(), sh = a.sheet, s = a.span ? a.span(false) : { n: 1 }, sc = a.span(true);
       const rowsN = s.n > 1 ? s.n + ' filas' : '1 fila', colsN = sc.n > 1 ? sc.n + ' columnas' : '1 columna';
+      const exportItems = window.AndroidSpreadsheet ? [
+        { label: 'Guardar como', icon: 'download', sub: [
+          { label: 'Excel (.xlsx)', key: 'Ctrl+S', action: run('saveXlsx') },
+          { label: 'Hoja actual (.csv)', action: run('exportCsv') },
+          { label: 'Copia del libro (.json)', action: run('saveJson') },
+          { label: 'PDF (.pdf)', action: run('savePdf') },
+        ] },
+      ] : [
+        { label: 'Descargar como Excel (.xlsx)', icon: 'download', key: 'Ctrl+S', action: run('saveXlsx') },
+        { label: 'Descargar hoja como CSV', action: run('exportCsv') },
+        { label: 'Descargar copia completa (.json)', action: run('saveJson') },
+      ];
       return [
         ['Archivo', [
           { label: 'Nuevo', icon: 'file', action: run('newBook') },
           { label: 'Abrir…', icon: 'upload', key: 'Ctrl+O', action: run('open') },
           { label: 'Abrir libro de ejemplo', icon: 'table', action: run('example') },
           '-',
-          { label: 'Descargar como Excel (.xlsx)', icon: 'download', key: 'Ctrl+S', action: run('saveXlsx') },
-          { label: 'Descargar hoja como CSV', action: run('exportCsv') },
-          { label: 'Descargar copia completa (.json)', action: run('saveJson') },
+          ...exportItems,
           '-',
           { label: 'Imprimir…', icon: 'print', key: 'Ctrl+P', action: run('print') },
           '-',
@@ -167,6 +177,8 @@
           { label: 'Ordenar rango…', action: run('sortDialog') },
           '-',
           { label: 'Filtro', icon: 'filter', checked: !!sh.filter, key: 'Ctrl+Mayús+L', action: run('toggleFilter') },
+          { label: 'Borrar filtros de la hoja', disabled: !sh.filter || !Object.keys(sh.filter.cols || {}).length,
+            action: () => a.wb.setFilter(sh, { ...sh.filter, cols: {} }) },
           '-',
           { label: 'Validación de datos…', icon: 'valid', action: run('validation') },
           { label: 'Tabla dinámica…', icon: 'table', action: run('pivot') },
@@ -179,7 +191,12 @@
         ]],
         ['Ayuda', [
           { label: 'Lista de funciones', icon: 'fx', action: run('insertFunction') },
-          { label: 'Atajos de teclado', icon: 'help', action: run('shortcuts') },
+          ...(window.AndroidSpreadsheet ? [
+            { label: 'Gestos y acciones', icon: 'help', action: run('touchHelp') },
+            { label: 'Acerca de', action: run('about') },
+          ] : [
+            { label: 'Atajos de teclado', icon: 'help', action: run('shortcuts') },
+          ]),
         ]],
       ];
     },
@@ -210,8 +227,15 @@
       };
       names.forEach((n, i) => {
         const b = h('button.menu-btn', { type: 'button', role: 'menuitem', 'aria-haspopup': 'true' }, n);
-        b.addEventListener('pointerdown', (e) => { e.preventDefault(); if (this._menuOpen === i) { ui.closePopups(); return; } const a = app(); if (a.edit && !a.commitEdit()) return; open(i); });
-        b.addEventListener('pointerenter', () => { if (this._menuOpen >= 0 && this._menuOpen !== i) open(i); });
+        const toggle = () => {
+          if (this._menuOpen === i) { ui.closePopups(); return; }
+          const a = app();
+          if (a.edit && !a.commitEdit()) return;
+          open(i);
+        };
+        b.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'touch') { e.preventDefault(); toggle(); } });
+        b.addEventListener('click', (e) => { if (e.pointerType === 'touch' || e.sourceCapabilities?.firesTouchEvents) toggle(); });
+        b.addEventListener('pointerenter', (e) => { if (e.pointerType !== 'touch' && this._menuOpen >= 0 && this._menuOpen !== i) open(i); });
         b.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') { e.preventDefault(); open(i); } });
         buttons.push(b); this.menubar.appendChild(b);
       });
@@ -299,6 +323,14 @@
       const a = app(), sh = a.sheet, s = a.span(false), sc = a.span(true), cell = sh.get(a.sel.r, a.sel.c);
       const rowsN = s.n > 1 ? s.n + ' filas' : 'fila', colsN = sc.n > 1 ? sc.n + ' columnas' : 'columna';
       ui.menu([
+        ...(window.AndroidSpreadsheet ? [
+          { label: 'Editar en la celda', action: () => a.startEdit(null, { mode: 'edit', where: 'cell' }) },
+          { label: 'Autorrellenar con el dedo', disabled: !a.canArmTouchFill(), sub: [
+            { label: 'Continuar serie', action: () => a.armTouchFill(true) },
+            { label: 'Copiar celdas', action: () => a.armTouchFill(false) },
+          ] },
+          '-',
+        ] : []),
         { label: 'Cortar', icon: 'cut', key: 'Ctrl+X', action: run('cut') }, { label: 'Copiar', icon: 'copy', key: 'Ctrl+C', action: run('copy') }, { label: 'Pegar', icon: 'paste', key: 'Ctrl+V', action: run('paste') },
         { label: 'Pegado especial', sub: this.pasteSpecial() },
         '-',
@@ -311,6 +343,7 @@
         '-',
         { label: cell && cell.note ? 'Editar nota' : 'Insertar nota', icon: 'note', action: run('insertNote') },
         cell && cell.note ? { label: 'Eliminar nota', action: () => { a.wb.setNote(sh, a.sel.r, a.sel.c, null); a.focusGrid(); } } : null,
+        cell && cell.f != null && /^HYPERLINK\(/.test(cell.f) ? { label: 'Abrir vínculo', icon: 'link', action: () => a.openLink(a.sel.r, a.sel.c) } : null,
         { label: 'Vínculo…', icon: 'link', action: run('insertLink') },
         { label: 'Insertar gráfica', icon: 'chart', sub: CHARTS.map(([t, n]) => ({ label: n, action: run('insertChart', t) })) },
         '-',
@@ -347,14 +380,18 @@
       this.tabs.replaceChildren(...wb.sheets.map((sh, i) => {
         const tab = h('div.sheet-tab' + (i === wb.active ? '.on' : ''), { role: 'tab', 'aria-selected': i === wb.active ? 'true' : 'false', title: sh.name }, h('span.tab-name', sh.name));
         if (sh.tabColor) tab.style.setProperty('--tab-color', sh.tabColor);
+        const activate = () => {
+          const keep = !!(a.edit && a.edit.text[0] === '=');
+          const pos = keep ? a.activeInput().selectionStart : 0;
+          a.activateSheet(i, keep);
+          if (keep) { a.edit.point = null; a.edit.where = 'bar'; a.focusEditor(); this.fx.setSelectionRange(pos, pos); }
+          else a.focusGrid();
+        };
         tab.addEventListener('pointerdown', (e) => {
-          if (e.button !== 0) return;
+          if (e.button !== 0 || e.pointerType === 'touch') return;
           e.preventDefault();
           if (i !== wb.active) {
-            const keep = !!(a.edit && a.edit.text[0] === '=');
-            const pos = keep ? a.activeInput().selectionStart : 0;
-            a.activateSheet(i, keep);
-            if (keep) { a.edit.point = null; a.edit.where = 'bar'; a.focusEditor(); this.fx.setSelectionRange(pos, pos); } else a.focusGrid();
+            activate();
             return;
           }
           // arrastrar para reordenar
@@ -371,6 +408,7 @@
           };
           document.addEventListener('pointermove', move); document.addEventListener('pointerup', up);
         });
+        tab.addEventListener('click', (e) => { if (i !== wb.active && (e.pointerType === 'touch' || e.sourceCapabilities?.firesTouchEvents)) activate(); });
         tab.addEventListener('dblclick', () => this.renameTab(sh, tab));
         tab.addEventListener('contextmenu', (e) => { e.preventDefault(); if (a.edit && !a.commitEdit()) return; a.activateSheet(i); this.tabMenu(sh, { x: e.clientX, y: e.clientY }); });
         return tab;
@@ -435,7 +473,10 @@
       const s = a.sel, sh = a.sheet, g = a.range, B = this.btn;
       if (document.activeElement !== this.nameBox) {
         const rows = g.r2 - g.r1 + 1, cols = g.c2 - g.c1 + 1, m = sh.mergeAt(s.r, s.c);
-        this.nameBox.value = a.drag && a.drag.type === 'select' && (rows > 1 || cols > 1) && !(m && HC.sameRange(m, g)) ? (rows >= MAXR ? cols + 'C' : cols >= MAXC ? rows + 'F' : rows + 'F x ' + cols + 'C') : HC.addr(s.r, s.c);
+        const multiple = (rows > 1 || cols > 1) && !(m && HC.sameRange(m, g));
+        if (multiple && a.touchSelection) this.nameBox.value = HC.rangeAddr(g);
+        else if (multiple && a.drag && a.drag.type === 'select') this.nameBox.value = rows >= MAXR ? cols + 'C' : cols >= MAXC ? rows + 'F' : rows + 'F x ' + cols + 'C';
+        else this.nameBox.value = HC.addr(s.r, s.c);
       }
       this.updateFormulaBar();
       const st = sh.styleAt(s.r, s.c) || {};

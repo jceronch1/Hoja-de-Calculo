@@ -534,10 +534,15 @@
   // ---------------------------------------------------------------- entrada principal
   const NAMES = { column: 'Gráfica de columnas', bar: 'Gráfica de barras', line: 'Gráfica de líneas', area: 'Gráfica de áreas', pie: 'Gráfica circular', doughnut: 'Gráfica de anillo', scatter: 'Gráfica de dispersión', bubble: 'Gráfica de burbujas', radar: 'Gráfica radial', combo: 'Gráfica combinada', histogram: 'Histograma' };
   R.render = function (spec, data, W, H, T) {
+    W = Number(W); H = Number(H);
+    if (!Number.isFinite(W) || !Number.isFinite(H) || W <= 0 || H <= 0) throw new Error('Dimensiones de gráfica no válidas.');
     T = T || R.theme();
     const o = spec.opts || {}, type = spec.type, id = String(spec.id || 'g').replace(/[^\w-]/g, '');
     const out = [], area = { left: 14, right: W - 14, top: 12, bottom: H - 12 };
-    const colorOf = (k) => (o.colors && o.colors[k]) || T.series[k % T.series.length];
+    const colorOf = (k) => {
+      const color = o.colors && o.colors[k];
+      return typeof color === 'string' && /^#[0-9a-f]{6}$/i.test(color) ? color : T.series[k % T.series.length];
+    };
     if (spec.title) { out.push(text(W / 2, area.top + 9, clip(spec.title, W - 28, 15, 600), 15, T.text, 'middle', ' font-weight="600"')); area.top += 28; }
     if (data.note) { out.push(text(W - 12, H - 9, data.note, 10.5, T.muted, 'end')); area.bottom -= 14; }
     const isPie = type === 'pie' || type === 'doughnut', xy = type === 'scatter' || type === 'bubble';

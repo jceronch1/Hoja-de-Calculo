@@ -58,8 +58,11 @@
       return wb;
     },
     async saveXlsx() {
-      const a = A();
-      try { ui.download(await HC.xlsx.write(a.wb), safeName(a.wb.title) + '.xlsx'); a.wb.modified = false; } catch (e) { console.error(e); ui.alert('No se pudo crear el archivo de Excel.\n' + e.message); }
+      const wb = A().wb, title = wb.title, generation = wb.gen;
+      try {
+        if (await ui.download(await HC.xlsx.write(wb), safeName(title) + '.xlsx')
+            && generation === wb.gen && title === wb.title) wb.modified = false;
+      } catch (e) { console.error(e); ui.alert('No se pudo crear el archivo de Excel.\n' + e.message); }
     },
     saveJson() {
       const a = A();
@@ -73,27 +76,64 @@
       ui.download(new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' }), safeName(a.wb.title + ' - ' + sh.name) + '.csv');
     },
 
+    savePdf() {
+      const a = A(), sh = a.sheet, range = a.range, used = sh.usedRange();
+      if (used.r2 < 0 && !sh.charts.length) { ui.toast('La hoja está vacía.'); return; }
+      const scopes = [['sheet', 'Hoja actual (incluye gráficas)']];
+      if (used.r2 >= 0 && HC.rangesIntersect(range, used)) scopes.push(['range', 'Selección (' + HC.rangeAddr(range) + ')']);
+      const scope = ui.select(scopes, 'sheet');
+      const paper = ui.select([['portrait', 'Vertical'], ['landscape', 'Horizontal']], 'portrait');
+      ui.dialog({
+        title: 'Guardar como PDF',
+        body: h('div', ui.field('Contenido', scope), ui.field('Orientación (A4)', paper)),
+        buttons: [{ label: 'Cancelar' }, { label: 'Continuar', primary: true, action: () => {
+          this.print({ pdf: true, range: scope.value === 'range' ? range : null, landscape: paper.value === 'landscape' });
+        } }],
+      });
+    },
+
     // ------------------------------------------------------------ imprimir
-    print() {
-      const a = A(), sh = a.sheet, wb = a.wb, u = sh.usedRange(), esc = ui.esc;
-      if (u.r2 < 0 && !sh.charts.length) { ui.toast('La hoja está vacía: no hay nada que imprimir.'); return; }
-      const r2 = Math.min(u.r2, 4999), c2 = Math.min(u.c2, 199);
+    print(options = {}) {
+      const a = A(), sh = a.sheet, wb = a.wb, used = sh.usedRange(), esc = ui.esc;
+      const range = options.range || used;
+      const r1 = range.r1, c1 = range.c1, r2 = Math.min(range.r2, used.r2), c2 = Math.min(range.c2, used.c2);
+      const rows = [], cols = [];
+      for (let r = r1; r <= r2; r++) if (sh.rowH.size(r) > 0) rows.push(r);
+      for (let c = c1; c <= c2; c++) if (sh.colW.size(c) > 0) cols.push(c);
+      const charts = !options.range && HC.charts ? HC.charts.svgs(sh) : [];
+      if ((!rows.length || !cols.length) && !charts.length) {
+        ui.toast('No hay celdas visibles que exportar.');
+        return;
+      }
+      if (rows.length * cols.length > 200000) {
+        ui.alert('El área visible es demasiado grande. Selecciona un rango más pequeño y guárdalo como PDF.', 'Exportar hoja');
+        return;
+      }
       let html = '';
-      if (u.r2 >= 0) {
-        const covered = new Set(), spans = new Map();
-        for (const m of sh.merges) { spans.set(m.r1 + ':' + m.c1, m); for (let r = m.r1; r <= m.r2; r++) for (let c = m.c1; c <= m.c2; c++) if (r !== m.r1 || c !== m.c1) covered.add(r + ':' + c); }
-        let tw = 0;
-        for (let c = 0; c <= c2; c++) tw += sh.colW.size(c);
-        html += '<table style="width:' + tw + 'px"><colgroup>';
-        for (let c = 0; c <= c2; c++) html += '<col style="width:' + sh.colW.size(c) + 'px">';
+      if (rows.length && cols.length) {
+        const bounds = { r1, c1, r2, c2 }, merges = new Map();
+        for (const m of sh.merges) {
+          if (!HC.rangesIntersect(bounds, m)) continue;
+          const mr = rows.filter((r) => r >= m.r1 && r <= m.r2);
+          const mc = cols.filter((c) => c >= m.c1 && c <= m.c2);
+          for (const r of mr) for (const c of mc) {
+            merges.set(r + ':' + c, r === mr[0] && c === mc[0]
+              ? { r: m.r1, c: m.c1, height: mr.length, width: mc.length } : null);
+          }
+        }
+        const tw = cols.reduce((total, c) => total + sh.colW.size(c), 0);
+        html += '<table style="width:' + tw + 'px;max-width:100%"><colgroup>';
+        for (const c of cols) html += '<col style="width:' + (100 * sh.colW.size(c) / tw) + '%">';
         html += '</colgroup>';
         const bcss = (spec, side) => { const p = spec.split(' '); const w = { thin: '1px solid', medium: '2px solid', thick: '3px solid', dashed: '1px dashed', dotted: '1px dotted', double: '3px double' }[p[0]] || '1px solid'; return 'border-' + side + ':' + w + ' ' + (p[1] || '#000'); };
-        for (let r = 0; r <= r2; r++) {
-          if (sh.rowH.size(r) === 0) continue;
+        for (const r of rows) {
           html += '<tr style="height:' + sh.rowH.size(r) + 'px">';
-          for (let c = 0; c <= c2; c++) {
-            if (covered.has(r + ':' + c) || sh.colW.size(c) === 0) continue;
-            const cell = sh.get(r, c), st = sh.styleAt(r, c) || {}, cf = sh.condFmts.length ? wb.condStyle(sh, r, c) || {} : {}, m = spans.get(r + ':' + c);
+          for (const c of cols) {
+            const m = merges.get(r + ':' + c);
+            if (m === null) continue;
+            const row = m ? m.r : r, col = m ? m.c : c;
+            const cell = sh.get(row, col), st = sh.styleAt(row, col) || {};
+            const cf = sh.condFmts.length ? wb.condStyle(sh, row, col) || {} : {};
             const v = cell ? cell.v : null, f = v == null ? { text: '' } : HC.fmt.format(v, st.nf);
             const css = [];
             const al = st.ha || (typeof v === 'number' ? 'r' : typeof v === 'string' || v == null ? 'l' : 'c');
@@ -107,15 +147,21 @@
             // como en pantalla: el texto largo invade la celda de la derecha si está vacía
             if (!st.wrap && typeof v === 'string' && c < c2 && !m) { const nx = sh.get(r, c + 1); if (!nx || nx.v == null || nx.v === '') css.push('overflow:visible'); }
             if (st.bt) css.push(bcss(st.bt, 'top')); if (st.bb) css.push(bcss(st.bb, 'bottom')); if (st.bl) css.push(bcss(st.bl, 'left')); if (st.br) css.push(bcss(st.br, 'right'));
-            html += '<td' + (m ? ' rowspan="' + (m.r2 - m.r1 + 1) + '" colspan="' + (m.c2 - m.c1 + 1) + '"' : '') + ' style="' + css.join(';') + '">' + esc(f.text) + '</td>';
+            html += '<td' + (m ? ' rowspan="' + m.height + '" colspan="' + m.width + '"' : '') + ' style="' + esc(css.join(';')) + '">' + esc(f.text) + '</td>';
           }
           html += '</tr>';
         }
         html += '</table>';
       }
-      if (HC.charts) for (const svg of HC.charts.svgs(sh)) html += '<div class="chart">' + svg + '</div>';
+      for (const svg of charts) html += '<div class="chart">' + svg + '</div>';
       const vars = ['--chart-surface:#fff', '--chart-text:#0b0b0b', '--chart-text-2:#52514e', '--chart-muted:#7d7b75', '--chart-grid:#e1e0d9', '--chart-axis:#c3c2b7', '--s1:#2a78d6', '--s2:#eb6834', '--s3:#1baf7a', '--s4:#eda100', '--s5:#e87ba4', '--s6:#008300', '--s7:#6250d6', '--s8:#e34948'].join(';');
-      const doc = '<!doctype html><html lang="es"><head><meta charset="utf-8"><title>' + esc(wb.title + ' · ' + sh.name) + '</title><style>:root{' + vars + '}@page{margin:12mm}body{margin:0;font:11pt Calibri,Carlito,Arial,sans-serif;color:#000;-webkit-print-color-adjust:exact;print-color-adjust:exact}table{border-collapse:collapse;table-layout:fixed}td{padding:1px 3px;overflow:hidden;' + (sh.showGrid ? 'border:1px solid #d4d4d4' : '') + '}.chart{margin:14px 0;break-inside:avoid;font-family:"Segoe UI",Arial,sans-serif}h1{font:600 13pt "Segoe UI",Arial,sans-serif;margin:0 0 8px}</style></head><body><h1>' + esc(wb.title + ' · ' + sh.name) + '</h1>' + html + '</body></html>';
+      const title = wb.title + ' · ' + sh.name + (options.range ? ' · ' + HC.rangeAddr(options.range) : '');
+      const doc = '<!doctype html><html lang="es"><head><meta charset="utf-8"><title>' + esc(title) + '</title><style>:root{' + vars + '}@page{margin:12mm}body{margin:0;font:11pt Calibri,Carlito,Arial,sans-serif;color:#000;-webkit-print-color-adjust:exact;print-color-adjust:exact}table{border-collapse:collapse;table-layout:fixed}tr{break-inside:avoid}td{padding:1px 3px;overflow:hidden;' + (sh.showGrid ? 'border:1px solid #d4d4d4' : '') + '}.chart{margin:14px 0;break-inside:avoid;font-family:"Segoe UI",Arial,sans-serif}.chart svg{max-width:100%;height:auto}h1{font:600 13pt "Segoe UI",Arial,sans-serif;margin:0 0 8px}</style></head><body><h1>' + esc(title) + '</h1>' + html + '</body></html>';
+      if (window.AndroidSpreadsheet) {
+        if (options.pdf) window.AndroidSpreadsheet.printPdf(safeName(title), doc, options.landscape);
+        else window.AndroidSpreadsheet.print(title, doc);
+        return;
+      }
       const frame = h('iframe', { style: { position: 'fixed', right: '0', bottom: '0', width: '0', height: '0', border: '0' }, 'aria-hidden': 'true' });
       document.body.appendChild(frame);
       frame.contentDocument.open(); frame.contentDocument.write(doc); frame.contentDocument.close();

@@ -4,6 +4,7 @@
   const HC = window.HC, ui = HC.ui, h = ui.h;
   const MAXR = HC.MAX_ROWS, MAXC = HC.MAX_COLS, K = 16384;
   const PAD = 3, SB = 14;
+  const HANDLE_RADIUS = 6;
   const EMPTY = Object.freeze({});
   HC.FONT_STACK = 'Calibri, Carlito, "Segoe UI", Arial, sans-serif';
   HC.FONTS = ['Arial', 'Calibri', 'Cambria', 'Comic Sans MS', 'Consolas', 'Courier New', 'Georgia', 'Segoe UI', 'Tahoma', 'Times New Roman', 'Trebuchet MS', 'Verdana'];
@@ -20,11 +21,12 @@
       this.vthumb = h('div.sb-thumb'); this.hthumb = h('div.sb-thumb');
       this.vbar = h('div.sb.sb-v', this.vthumb); this.hbar = h('div.sb.sb-h', this.hthumb);
       this.sink = h('textarea.focus-sink', { 'aria-label': 'Hoja de cálculo. Usa las flechas para moverte entre celdas.', autocomplete: 'off', autocapitalize: 'off', spellcheck: false, tabindex: '0' });
+      if (window.matchMedia('(pointer: coarse)').matches) this.sink.inputMode = 'none';
       host.append(this.canvas, this.layer, this.vbar, this.hbar, h('div.sb-corner'), this.sink);
       this.hdrW = 46; this.hdrH = 22; this.zoom = 1; this.dpr = 1;
       this.vw = 100; this.vh = 100;
       this.widths = new Map(); this.wraps = new Map();
-      this.hits = []; this.geo = null; this._raf = 0; this._font = '';
+      this.hits = []; this.handles = []; this.geo = null; this._raf = 0; this._font = '';
       this.loadTheme();
       this._bindScrollbars();
       if (window.ResizeObserver) new ResizeObserver(() => this.resize()).observe(host);
@@ -48,12 +50,34 @@
       this.canvas.width = Math.round(cw * this.dpr); this.canvas.height = Math.round(ch * this.dpr);
       this.vw = cw / this.zoom; this.vh = ch / this.zoom;
       this.layoutLayer();
+      if (window.AndroidSpreadsheet) this.app.keepCellEditorVisible();
       this.render();
     }
-    setZoom(z) {
+    zoomAnchor(x, y) {
+      const sh = this.sheet, v = sh.view;
+      const lx = x / this.zoom - this.hdrW, ly = y / this.zoom - this.hdrH;
+      return {
+        x: lx < sh.colW.pos(sh.frozenCols) ? null : v.scrollX + lx,
+        y: ly < sh.rowH.pos(sh.frozenRows) ? null : v.scrollY + ly,
+      };
+    }
+    setZoom(z, point) {
+      const previous = this.zoom;
       this.zoom = HC.clamp(Math.round(z * 100) / 100, 0.25, 4);
-      this.widths.clear(); this.wraps.clear();
-      this.resize();
+      if (this.zoom !== previous) {
+        this.vw = this.vw * previous / this.zoom;
+        this.vh = this.vh * previous / this.zoom;
+        this.layoutLayer();
+        this.invalidate();
+      }
+      const sh = this.sheet, v = sh.view;
+      let sx = v.scrollX, sy = v.scrollY;
+      if (point) {
+        const { x, y, anchor } = point;
+        if (anchor.x != null) sx = anchor.x - Math.max(sh.colW.pos(sh.frozenCols), x / this.zoom - this.hdrW);
+        if (anchor.y != null) sy = anchor.y - Math.max(sh.rowH.pos(sh.frozenRows), y / this.zoom - this.hdrH);
+      }
+      this.scrollTo(sx, sy);
     }
     layoutLayer() {
       const z = this.zoom;
@@ -74,28 +98,60 @@
     }
     colAt(lx) { const sh = this.sheet, fx = sh.colW.pos(sh.frozenCols), x = lx - this.hdrW; return HC.clamp(sh.colW.indexAt(x < fx ? x : x + sh.view.scrollX), 0, MAXC - 1); }
     rowAt(ly) { const sh = this.sheet, fy = sh.rowH.pos(sh.frozenRows), y = ly - this.hdrH; return HC.clamp(sh.rowH.indexAt(y < fy ? y : y + sh.view.scrollY), 0, MAXR - 1); }
+    touchDivider(at, index, isCol) {
+      const sh = this.sheet, axis = isCol ? sh.colW : sh.rowH;
+      const frozen = isCol ? sh.frozenCols : sh.frozenRows;
+      const first = isCol ? this.hdrW : this.hdrH;
+      const seam = first + axis.pos(frozen), limit = isCol ? this.vw : this.vh;
+      const left = isCol ? this.colX(index) : this.rowY(index), width = axis.size(index);
+      const slop = Math.min(9 / this.zoom, width * 0.38);
+      const paneEnd = index < frozen ? Math.min(seam, limit) : limit;
+      if (left + width <= paneEnd && left + width - at <= slop) return index;
+      const position = axis.pos(index);
+      if (position <= 0 || at - left > slop) return null;
+      const previous = axis.indexAt(position - 0.001);
+      const end = (isCol ? this.colX(previous) : this.rowY(previous)) + axis.size(previous);
+      return Math.abs(end - left) < 0.001 ? previous : null;
+    }
     // Qué hay bajo un punto (coordenadas CSS relativas al lienzo).
-    hit(px, py) {
+    hit(px, py, touch = false) {
       if (this._raf) this.render(); // las zonas activas (controlador de relleno, filtros) dependen del último dibujo
       const lx = px / this.zoom, ly = py / this.zoom, sh = this.sheet;
       if (lx < this.hdrW && ly < this.hdrH) return { t: 'corner' };
       if (ly < this.hdrH) {
-        const c = this.colAt(lx), x1 = this.colX(c), x2 = x1 + sh.colW.size(c);
+        const c = this.colAt(lx);
+        if (touch) return { t: 'colhdr', c, resize: this.touchDivider(lx, c, true) };
+        const x1 = this.colX(c), x2 = x1 + sh.colW.size(c);
         let resize = null;
         if (x2 - lx <= 4) resize = c; else if (lx - x1 <= 4 && c > 0) { resize = c - 1; while (resize > 0 && sh.colW.size(resize) === 0 && sh.colW.hidden.has(resize)) resize--; }
         return { t: 'colhdr', c, resize };
       }
       if (lx < this.hdrW) {
-        const r = this.rowAt(ly), y1 = this.rowY(r), y2 = y1 + sh.rowH.size(r);
+        const r = this.rowAt(ly);
+        if (touch) return { t: 'rowhdr', r, resize: this.touchDivider(ly, r, false) };
+        const y1 = this.rowY(r), y2 = y1 + sh.rowH.size(r);
         let resize = null;
         if (y2 - ly <= 3) resize = r; else if (ly - y1 <= 3 && r > 0) resize = r - 1;
         return { t: 'rowhdr', r, resize };
       }
       for (let i = this.hits.length - 1; i >= 0; i--) { const q = this.hits[i]; if (lx >= q.x && lx <= q.x + q.w && ly >= q.y && ly <= q.y + q.h) return q; }
       let r = this.rowAt(ly), c = this.colAt(lx);
+      if (touch && sh.filter && r === sh.filter.range.r1) {
+        const filter = this.hits.find((q) => q.t === 'filter' && q.r === r && q.c === c);
+        const right = this.colX(c) + sh.colW.size(c);
+        if (filter && (right - lx) * this.zoom <= 24 && right - lx <= sh.colW.size(c) / 2) return filter;
+      }
       const m = sh.mergeAt(r, c);
       if (m) { r = m.r1; c = m.c1; }
       return { t: 'cell', r, c };
+    }
+    hitHandle(px, py) {
+      let closest = null, distance = 2 * HANDLE_RADIUS;
+      for (const handle of this.handles) {
+        const d = Math.hypot(px - handle.x, py - handle.y);
+        if (d < distance) { distance = d; closest = handle; }
+      }
+      return closest;
     }
     viewSize() { const sh = this.sheet; return { w: this.vw - this.hdrW - sh.colW.pos(sh.frozenCols), h: this.vh - this.hdrH - sh.rowH.pos(sh.frozenRows) }; }
     scrollTo(sx, sy) {
@@ -250,6 +306,8 @@
       for (const p of panes) this.drawPane(p);
       for (const p of panes) this.drawOverlays(p);
       this.drawHeaders();
+      this.drawResizeGuide();
+      this.drawTouchHandles(panes);
       this.updateScrollbars();
       this.app.afterRender();
     }
@@ -464,7 +522,7 @@
             } else ctx.fillRect(b.x, b.y, b.w - 1, b.h - 1);
           }
           this.strokeBox(b, T.accent, last ? 2 : 1);
-          if (last && b.right && b.bottom && !editing && !app.readOnlyDrag) {
+          if (last && b.right && b.bottom && !editing && !app.readOnlyDrag && !app.touchSelection) {
             const hx = b.x + b.w - 5, hy = b.y + b.h - 5;
             ctx.fillStyle = T.cellBg; ctx.fillRect(hx - 1, hy - 1, 8, 8);
             ctx.fillStyle = T.accent; ctx.fillRect(hx, hy, 6, 6);
@@ -490,7 +548,47 @@
       }
       ctx.restore();
     }
+    drawTouchHandles(panes) {
+      this.handles = [];
+      const app = this.app, sh = this.sheet, range = app.range, ctx = this.ctx, z = this.zoom;
+      if (!app.touchSelection || app.edit || app.readOnlyDrag || !range
+          || range.r2 - range.r1 >= MAXR - 1 || range.c2 - range.c1 >= MAXC - 1) return;
+      const fill = !!app.touchFill, radius = (fill ? HANDLE_RADIUS + 2 : HANDLE_RADIUS) / z;
+      for (const start of fill ? [false] : [true, false]) {
+        const r = start ? range.r1 : range.r2, c = start ? range.c1 : range.c2;
+        const p = panes.find((pane) => pane.frow === (r < sh.frozenRows) && pane.fcol === (c < sh.frozenCols));
+        const after = start ? 0 : 1;
+        const x = this.paneX(p, c + after), y = this.paneY(p, r + after);
+        if (x < p.x || x > p.x + p.w || y < p.y || y > p.y + p.h) continue;
+        const offset = start ? -radius : radius;
+        const hx = HC.clamp(x + offset, this.hdrW + radius, this.vw - radius);
+        const hy = HC.clamp(y + offset, this.hdrH + radius, this.vh - radius);
+        const inside = start ? 0.5 : -0.5;
+        this.handles.push({
+          x: hx * z, y: hy * z, dx: (x + inside - hx) * z, dy: (y + inside - hy) * z,
+          r: start ? range.r2 : range.r1, c: start ? range.c2 : range.c1, fill,
+        });
+        ctx.fillStyle = this.theme.accent;
+        ctx.strokeStyle = this.theme.cellBg;
+        ctx.lineWidth = 1.5 / z;
+        ctx.beginPath();
+        if (fill) ctx.roundRect(hx - radius, hy - radius, 2 * radius, 2 * radius, 2 / z);
+        else ctx.arc(hx, hy, radius, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
     activeRect() { const s = this.app.sel, m = this.sheet.mergeAt(s.r, s.c); return m || { r1: s.r, c1: s.c, r2: s.r, c2: s.c }; }
+
+    drawResizeGuide() {
+      const d = this.app.drag;
+      if (d?.type !== 'resize' || !d.touch || d.sheet !== this.sheet || d.size == null) return;
+      const ctx = this.ctx, width = 2 / this.zoom;
+      const edge = this.snap((d.isCol ? this.colX(d.idx) : this.rowY(d.idx)) + d.size);
+      ctx.fillStyle = this.theme.accent;
+      if (d.isCol) ctx.fillRect(edge - width / 2, 0, width, this.vh);
+      else ctx.fillRect(0, edge - width / 2, this.vw, width);
+    }
 
     drawHeaders() {
       const ctx = this.ctx, T = this.theme, sh = this.sheet, g = this.geo, one = this.one, sel = this.app.sel;

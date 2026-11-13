@@ -31,7 +31,8 @@
     focusGrid() { if (this.edit) this.focusEditor(); else baseFocus.call(this); },
     editorEl() {
       if (this._ed) return this._ed;
-      const ed = (this._ed = h('textarea.cell-editor', { spellcheck: false, autocomplete: 'off', autocapitalize: 'off', rows: 1, wrap: 'off', 'aria-label': 'Editor de celda' }));
+      const ed = (this._ed = h('textarea.cell-editor', { spellcheck: false, autocomplete: 'off', autocapitalize: 'off', enterkeyhint: 'done', rows: 1, wrap: 'off', 'aria-label': 'Editor de celda' }));
+      if (window.AndroidSpreadsheet) ed.style.setProperty('-webkit-text-size-adjust', 'none');
       ed.hidden = true;
       this.grid.host.appendChild(ed);
       this.bindInput(ed, 'cell');
@@ -42,7 +43,13 @@
       el.addEventListener('keydown', (e) => this.onEditKey(e, src));
       el.addEventListener('keyup', (e) => { if (this.edit && /^(Arrow|Home|End)/.test(e.key)) this.updateHints(); });
       el.addEventListener('click', () => { if (this.edit) { this.edit.where = src; this.edit.point = null; if (src === 'cell') this.edit.mode = 'edit'; this.updateHints(); } });
-      if (src === 'bar') el.addEventListener('focus', () => { if (!this.edit) this.startEdit(null, { mode: 'edit', where: 'bar', keepCaret: true }); else this.edit.where = 'bar'; });
+      if (src === 'bar') el.addEventListener('focus', () => {
+        if (!this.edit) this.startEdit(null, { mode: 'edit', where: 'bar', keepCaret: true });
+        else {
+          this.edit.where = 'bar';
+          this.positionEditor();
+        }
+      });
     },
     activeInput() { return this.edit && this.edit.where === 'bar' ? HC.chrome.fx : this.editorEl(); },
     focusEditor() {
@@ -63,7 +70,6 @@
       const ed = this.editorEl(), fx = HC.chrome.fx;
       ed.value = init; ed.hidden = false;
       if (fx.value !== init) fx.value = init;
-      this.styleEditor();
       this.positionEditor(); // lo hace visible antes de darle el foco
       if (ed.style.display === 'none') this.edit.where = 'bar';
       HC.chrome.setEditing(true);
@@ -76,6 +82,7 @@
       const ed = this.editorEl(), e = this.edit, z = this.grid.zoom;
       const st = e.sheet.styleAt(e.r, e.c) || {};
       const px = (((st.fs || 11) * 4) / 3) * z;
+      e.editorZoom = z;
       Object.assign(ed.style, {
         fontFamily: st.ff ? '"' + st.ff + '", ' + HC.FONT_STACK : HC.FONT_STACK, fontSize: px.toFixed(2) + 'px', lineHeight: Math.round(px * 1.22) + 'px',
         fontWeight: st.b ? '700' : '400', fontStyle: st.i ? 'italic' : 'normal', color: st.fc || '', background: st.bg || '',
@@ -84,19 +91,31 @@
     positionEditor() {
       const ed = this._ed, e = this.edit;
       if (!ed) return;
-      if (!e || e.sheet !== this.sheet) { ed.style.display = 'none'; return; }
+      const android = !!window.AndroidSpreadsheet;
+      if (!e || e.sheet !== this.sheet || (e.where === 'bar' && (android || window.matchMedia('(pointer: coarse)').matches))) { ed.style.display = 'none'; return; }
       const g = this.grid, z = g.zoom, rc = g.cellRect(e.r, e.c), sh = this.sheet;
       const minX = g.hdrW + (e.c < sh.frozenCols ? 0 : sh.colW.pos(sh.frozenCols)), minY = g.hdrH + (e.r < sh.frozenRows ? 0 : sh.rowH.pos(sh.frozenRows));
       if (rc.x < minX - 1 || rc.y < minY - 1 || rc.x > g.vw - 8 || rc.y > g.vh - 8) { ed.style.display = 'none'; return; }
+      if (e.editorZoom !== z) this.styleEditor();
       ed.style.display = 'block';
       const font = (ed.style.fontStyle === 'italic' ? 'italic ' : '') + ed.style.fontWeight + ' ' + ed.style.fontSize + ' ' + ed.style.fontFamily;
       const lines = e.text.split('\n');
       let tw = 0;
       for (const l of lines) tw = Math.max(tw, g.textWidth(font, l));
-      const left = rc.x * z, top = rc.y * z, maxW = Math.max(60, g.vw * z - left - 4);
+      const left = rc.x * z;
       const lh = parseFloat(ed.style.lineHeight) || 18;
-      const w = Math.min(maxW, Math.max(rc.w * z, tw + 14)), hh = Math.min(Math.max(rc.h * z, lines.length * lh + 5), Math.max(rc.h * z, g.vh * z - top - 4));
+      const availableH = Math.max(1, g.vh * z - 4);
+      const top = android ? Math.min(rc.y * z, Math.max(g.hdrH * z, availableH - lh - 5)) : rc.y * z;
+      const maxW = android ? Math.max(1, g.vw * z - left - 2) : Math.max(60, g.vw * z - left - 4);
+      const maxH = android ? Math.max(1, availableH - top) : Math.max(rc.h * z, availableH - top);
+      const w = Math.min(maxW, Math.max(rc.w * z, tw + 14)), hh = Math.min(maxH, Math.max(rc.h * z, lines.length * lh + 5));
       Object.assign(ed.style, { left: left - 1 + 'px', top: top - 1 + 'px', width: w + 1 + 'px', height: hh + 1 + 'px', paddingTop: Math.max(0, Math.min(rc.h * z, hh) - lines.length * lh - 4) + 'px' });
+    },
+    keepCellEditorVisible() {
+      const e = this.edit;
+      if (!e || e.where !== 'cell' || e.sheet !== this.sheet) return;
+      this.grid.ensureVisible(e.r, e.c);
+      this.positionEditor();
     },
     endEdit() {
       this.edit = null;
